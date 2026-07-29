@@ -1,0 +1,19 @@
+services:
+  spread-backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    container_name: spread-backend-dev
+    ports:
+      - "${PORT:-4000}:4000"
+    env_file:
+      - .env
+    volumes:
+      # Source is mounted for hot reload; node_modules stays in the image so a
+      # host install with a different platform cannot break the container.
+      - ./src:/app/src
+      - node_modules:/app/node_modules
+    command: npx nodemon src/index.js
+
+volumes:
+  node_modules:

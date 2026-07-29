@@ -1,0 +1,14 @@
+services:
+  spread-backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: spread-backend
+    restart: unless-stopped
+    ports:
+      - "${PORT:-4000}:4000"
+    env_file:
+      - .env
+    mem_limit: 300m
+    environment:
+      NODE_OPTIONS: "--max-old-space-size=256"
