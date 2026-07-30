@@ -353,3 +353,82 @@ split into its own strategy row instead.
 
 **Total real fills to date: 4.** Every threshold here should be re-measured once
 `spread_orders` holds 50+.
+
+---
+
+## 29 Jul session — visibility fixes
+
+Raised by a real session where a filled position was invisible.
+
+**Root cause was data, not arithmetic.** The broker blotter shows
+`EQUIPMENT 26072909510 Buy 3,500 @ 238 FILLED 09:55:03` and
+`26072909594 Sell 3,500 @ 240 EXPIRED 0 filled 10:14:02`. The app had the buy as
+POSTED and the sell as CANCELLED. Every zero on the dashboard was correct for the
+data it held — and the data was wrong on both legs.
+
+What changed so it cannot happen quietly again:
+
+- **Trading section**, above the screener. Anything with your money in it is
+  listed whatever the screener thinks. Screening decides what to OPEN; it does
+  not get to decide what you can SEE.
+- **Working capital** is its own line. A posted buy is capital at risk, not
+  capital spent, and 833 KD went out against an 800 KD budget in silence.
+  Over-budget is now called out in red.
+- **The day cannot close with orders still POSTED.** Past 13:00 each one must be
+  answered: *It filled* / *Died at the close* / *I pulled it*.
+- **EXPIRED is separate from CANCELLED.** A broker killing a day order says
+  something about your queue position; you withdrawing it says nothing. Merging
+  them corrupts the fill-rate statistics.
+- **A rule that is not running says so.** `trendMap`/`gapMap` failures were
+  caught and dropped, so CR-12 was switched off in production while the Trend
+  column showed a dash as if that were normal.
+- **The action card shows WAIT** instead of suggesting a −0.04 KD order on a
+  1-fil spread while the banner above says the stock is not tradeable.
+
+**Commission validated against real slips.** Priced through `commission.js`, the
+28-Jul AQAR pair gives +1.9947 and +1.9813 → **+3.976 KD**, matching the broker
+to three decimals.
+
+**Frontend 63 checks. Backend 58 + 34.**
+
+---
+
+## Corrections from the BA dev brief — 29 Jul
+
+Three things the brief says that the build had wrong or missing.
+
+**1. Trend window was 3 sessions. It is now 20.**
+A four-day window is not a trend. ARGAN looked flat across four sessions while it
+had fallen 139 → 119 over five weeks, including an 8-fil gap down on 14 July. A
+short window reads the noise inside a downtrend as calm and lets exactly the
+wrong stock through. `FALLING` is now `close < prev AND close < close_20d`.
+
+**2. Step-down was elapsed minutes. It is now a clock.**
+`stepDownAfterMin: 45` → `stepDownAtClock: '12:00'`. On 29 July the entry price
+238 printed six times between 12:32 and 12:58 — a step-down at noon exits flat
+into one of those prints. By 12:50 the only choices left are the bid, which the
+rules forbid, or the auction. Elapsed time cannot know that; the clock can.
+The tests now pin `nowMinutes`, because a wall-clock-dependent assertion passes
+or fails depending on when you run it.
+
+**3. Gate 2 (postable queue) was missing.**
+The build checked queue share at the current instant only. The brief measures how
+OFTEN the bid depth is right-sized for the slot — 2–30% of the resting bid, on at
+least 50% of ticks over the trailing 12 days. Depth swings enormously minute to
+minute, so a single reading is close to noise and the average is misleading.
+`repo.postableMap()` computes it; the screener fails a stock that is postable on
+under half its ticks.
+
+### Confirmed by the brief, no change needed
+
+- SPREAD shares nothing with TMI. `rangeOverCost` is explicitly not used.
+- `entry_mode` — the brief also asks for `INSIDE/QUEUED` here. That column already
+  holds `BUTTON/MANUAL/EDIT`; placement stays in `entry_placement`.
+- Commission verified to 3dp against a real broker slip.
+
+### Not in this repo — flagged for whoever owns ingestion
+
+- `cron.schedule('*/1 9-12 ...')` → `9-13`, or the closing auction is never captured.
+- The scraper took 810 rows on 29 July against ~30,000 expected.
+- `stock_quotes` rolls at 12 days. Queue position is the variable that decides
+  whether trades fill, and a fortnight of it is all that exists.

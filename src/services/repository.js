@@ -404,13 +404,65 @@ async function bumpPeak(id, bid, db = pool) {
  * FALLING close < prev AND close <  close_Nd
  * else FLAT
  */
-async function trendMap(asOfDay, lookbackDays = 3, db = pool) {
+/*
+ * Resolve the date and close columns on stock_prices_daily.
+ *
+ * I hard-coded `trade_date` and `close` from memory and got "column close does
+ * not exist". Rather than guess again, ask the catalogue once and cache it — and
+ * if nothing matches, fail with the ACTUAL column list so the next person does
+ * not have to guess either.
+ */
+let dailyCols = null;
+const DATE_CANDIDATES  = ['trade_date', 'price_date', 'quote_date', 'bar_date', 'date', 'day', 'dt', 'as_of'];
+const CLOSE_CANDIDATES = ['close', 'close_price', 'closing_price', 'price_close', 'last_price',
+                          'last', 'settle_price', 'adj_close', 'c'];
+
+async function resolveDailyCols(db = pool) {
+  if (dailyCols) return dailyCols;
+  const { rows } = await db.query(
+    `SELECT column_name FROM information_schema.columns
+      WHERE table_schema = 'public' AND table_name = 'stock_prices_daily';`);
+  if (!rows.length) {
+    const e = new Error('public.stock_prices_daily does not exist or is not visible to this user');
+    e.code = 'NO_DAILY'; throw e;
+  }
+  const have = new Set(rows.map((r) => r.column_name));
+  const pick = (list) => list.find((c) => have.has(c)) || null;
+  const dateCol = process.env.DAILY_DATE_COL || pick(DATE_CANDIDATES);
+  const closeCol = process.env.DAILY_CLOSE_COL || pick(CLOSE_CANDIDATES);
+  const symCol = have.has('symbol') ? 'symbol' : (have.has('ticker') ? 'ticker' : null);
+
+  if (!dateCol || !closeCol || !symCol) {
+    const e = new Error(
+      'cannot map stock_prices_daily — ' +
+      `date=${dateCol || 'NOT FOUND'}, close=${closeCol || 'NOT FOUND'}, symbol=${symCol || 'NOT FOUND'}. ` +
+      `Columns present: ${[...have].join(', ')}. ` +
+      'Set DAILY_DATE_COL / DAILY_CLOSE_COL in the environment to override.');
+    e.code = 'NO_DAILY'; throw e;
+  }
+  dailyCols = { dateCol, closeCol, symCol };
+  console.log(`[spread] stock_prices_daily mapped: symbol=${symCol}, date=${dateCol}, close=${closeCol}`);
+  return dailyCols;
+}
+
+/*
+ * CR-12. Direction over the last N sessions.
+ * RISING  close > prev AND close >= close_Nd
+ * FALLING close < prev AND close <  close_Nd
+ * else FLAT
+ *
+ * 20+ sessions, not 3 — a four-day window reads the noise inside a downtrend as
+ * calm. ARGAN looked flat across four sessions having fallen 139 -> 119 over five
+ * weeks, including an 8-fil gap down on 14 July.
+ */
+async function trendMap(asOfDay, lookbackDays = 20, db = pool) {
+  const { dateCol, closeCol, symCol } = await resolveDailyCols(db);
   const { rows } = await db.query(
     `WITH d AS (
-       SELECT symbol, trade_date, close,
-              row_number() OVER (PARTITION BY symbol ORDER BY trade_date DESC) AS rn
+       SELECT ${symCol} AS symbol, ${closeCol}::numeric AS close,
+              row_number() OVER (PARTITION BY ${symCol} ORDER BY ${dateCol} DESC) AS rn
          FROM public.stock_prices_daily
-        WHERE trade_date <= $1
+        WHERE ${dateCol} <= $1 AND ${closeCol} IS NOT NULL
      )
      SELECT symbol,
             max(close) FILTER (WHERE rn = 1)             AS c0,
@@ -429,6 +481,35 @@ async function trendMap(asOfDay, lookbackDays = 3, db = pool) {
     else if (c0 < prev && c0 < base) trend = 'FALLING';
     m.set(r.symbol, { trend, changeFils: c0 - base, close: c0 });
   }
+  return m;
+}
+
+/*
+ * GATE 2 — postable queue, measured across ticks.
+ *
+ * Not "is the depth right-sized this instant" but "how often is it". Depth
+ * swings enormously minute to minute, so the mean is misleading and a single
+ * reading is close to noise. Your order wants to be 2-30% of the resting bid:
+ * under 2% you sit behind a wall (836,945 ahead never filled), over 30% you
+ * ARE the book. This is the gate that gets skipped, and skipping it is how
+ * every bad recommendation happened.
+ */
+async function postableMap(asOfDay, slotKd, cfg, db = pool) {
+  const lo = slotKd / (cfg.postableHighPct / 100);   // depth big enough that you are not the book
+  const hi = slotKd / (cfg.postableLowPct / 100);    // depth small enough that you are not behind a wall
+  const { rows } = await db.query(
+    `SELECT symbol,
+            round(100.0 * count(*) FILTER (
+              WHERE bid_qty::numeric * bid::numeric / 1000 BETWEEN $2 AND $3
+            ) / NULLIF(count(*),0)) AS pct_postable,
+            count(*) AS ticks
+       FROM public.stock_quotes
+      WHERE session = 'Trading' AND bid > 0 AND offer > bid
+        AND (created_at AT TIME ZONE 'UTC' + interval '3 hours')::date
+            BETWEEN ($1::date - interval '12 days') AND $1::date
+      GROUP BY symbol;`, [asOfDay, lo, hi]);
+  const m = new Map();
+  for (const r of rows) m.set(r.symbol, { pct: Number(r.pct_postable), ticks: Number(r.ticks) });
   return m;
 }
 
@@ -703,7 +784,7 @@ module.exports = {
   DDL, ensure, logEvent, validateLeg,
   nextSeq, recordLeg, resolveLeg, updateLeg, deleteLeg, legById,
   legsForDay, legsForContractsTouching, openLegs, eventsForDay,
-  openPositions, setCarryState, bumpPeak, trendMap, gapMap,
+  openPositions, setCarryState, bumpPeak, trendMap, gapMap, postableMap, resolveDailyCols,
   writeSnapshot, snapshotAt, snapshotTimes,
   pnlByDay, pnlBySymbol, executionStats, unrealised,
   activeConfig, saveConfig,

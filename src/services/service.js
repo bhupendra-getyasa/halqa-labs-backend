@@ -236,8 +236,35 @@ async function tick(tradingDay = kuwaitDay(), db = pool) {
   // screener cannot derive from a single quote. Cached for the day — neither
   // moves intraday, and re-querying 135 symbols every 15 seconds is waste.
   if (!d.trends || d.contextDay !== tradingDay) {
-    d.trends = await repo.trendMap(tradingDay, CFG.TREND.lookbackDays, db).catch(() => new Map());
-    d.gaps = await repo.gapMap(tradingDay, CFG.GAP.gapLookbackSessions, db).catch(() => new Map());
+    /*
+     * These used to be `.catch(() => new Map())` and nothing else. When the
+     * query failed — wrong table, wrong column names — every symbol silently
+     * got trend `null`, weight 1.0, and no falling stock was ever blocked.
+     * CR-12 was switched off in production and the screen showed a dash in the
+     * Trend column as if that were normal. A rule that fails has to say so.
+     */
+    d.trends = new Map(); d.gaps = new Map(); d.postable = new Map(); d.contextError = null;
+    try {
+      d.trends = await repo.trendMap(tradingDay, CFG.TREND.lookbackDays, db);
+    } catch (e) {
+      d.contextError = `Trend filter is OFF — ${e.message}`;
+      console.warn('[spread] trendMap:', e.message);
+    }
+    try {
+      d.gaps = await repo.gapMap(tradingDay, CFG.GAP.gapLookbackSessions, db);
+    } catch (e) {
+      d.contextError = (d.contextError ? d.contextError + ' · ' : '') + `Gap stats OFF — ${e.message}`;
+      console.warn('[spread] gapMap:', e.message);
+    }
+    try {
+      d.postable = await repo.postableMap(tradingDay, d.trading.budgetKd / (d.trading.maxStocks || 1), CFG.GAP, db);
+    } catch (e) {
+      d.contextError = (d.contextError ? d.contextError + ' · ' : '') + `Postable gate OFF — ${e.message}`;
+      console.warn('[spread] postableMap:', e.message);
+    }
+    if (!d.contextError && d.trends.size === 0) {
+      d.contextError = 'Trend filter is OFF — stock_prices_daily returned no rows for this lookback.';
+    }
     d.contextDay = tradingDay;
   }
 
@@ -254,7 +281,7 @@ async function tick(tradingDay = kuwaitDay(), db = pool) {
 
   const opts = {
     commissionCfg: LIVE.COMMISSION, day: tradingDay, lotSize: 100,
-    trends: d.trends, gaps: d.gaps, trendCfg: CFG.TREND, gapCfg: CFG.GAP,
+    trends: d.trends, gaps: d.gaps, postable: d.postable, trendCfg: CFG.TREND, gapCfg: CFG.GAP,
   };
   const screened = SCREENER.screen(book, trading, opts);
 
@@ -268,23 +295,93 @@ async function tick(tradingDay = kuwaitDay(), db = pool) {
     if (!bySymbol.has(l.symbol)) bySymbol.set(l.symbol, []);
     bySymbol.get(l.symbol).push(l);
   }
-  const positions = [];
-  let dayNetKd = 0, dayTrips = 0, dayCommKd = 0, deployedKd = 0;
+  // Mark prices, so an open position can be valued without a second query.
+  const bidBySymbol = new Map(book.map((r) => [r.symbol, r.bid == null ? null : Number(r.bid)]));
+
+  /*
+   * THE TRADING BUCKET.
+   *
+   * The list was a screener and nothing else: a symbol appeared only if it
+   * screened well TODAY. So EQUIPMENT — 3,500 shares held at 238 — vanished the
+   * moment its spread tightened to 1 fil, and the only trace left was one amber
+   * line. You had to search for a stock you owned.
+   *
+   * Screening decides what to OPEN. It has no business deciding what you can
+   * SEE. Anything with your money in it is listed, always, above the candidates.
+   */
+  const positions = [];   // held inventory only — drives the 12:50 alert
+  const tradingRows = [];  // everything with money committed OR an order working
+  let dayNetKd = 0, dayTrips = 0, dayCommKd = 0, deployedKd = 0, workingKd = 0;
+
   for (const [sym, legs] of bySymbol) {
+    const bid = bidBySymbol.has(sym) ? bidBySymbol.get(sym) : null;
+
     for (const c of buildContracts(legs)) {
-      if (c.state === 'closed') { dayNetKd += c.netKd; dayCommKd += c.commKd; dayTrips++; }
+      if (c.state === 'closed') { dayNetKd += c.netKd; dayCommKd += c.commKd; dayTrips++; continue; }
+      if (c.state === 'no fill') continue;
+
+      const entry = c.buy ? Number(c.buy.price) : null;
+      const shares = c.buy ? Number(c.buy.shares) : 0;
+      const committedKd = c.heldShares > 0 ? (entry * c.heldShares) / 1000 : 0;
+
+      // A posted buy is not a position, but it IS capital at risk: if it fills
+      // you have spent it. Reported separately so the two are never confused.
+      const working = c.state === 'posted' && c.buy && c.buy.side === 'BUY';
+      const atRiskKd = working ? (entry * shares) / 1000 : 0;
+
+      deployedKd += committedKd;
+      workingKd += atRiskKd;
+
       if (c.heldShares > 0) {
         positions.push({
           symbol: sym, seq: c.seq, state: c.state, shares: c.heldShares,
           buyId: c.buy.id, openedOn: c.openedOn, carried: c.carried,
-          buyPrice: Number(c.buy.price),
+          buyPrice: entry,
           offerPrice: c.sell ? Number(c.sell.price) : null,
-          costKd: (Number(c.buy.price) * c.heldShares) / 1000,
+          costKd: committedKd,
         });
-        deployedKd += (Number(c.buy.price) * c.heldShares) / 1000;
       }
+
+      tradingRows.push({
+        symbol: sym, seq: c.seq, state: c.state, carried: c.carried, openedOn: c.openedOn,
+        buyId: c.buy ? c.buy.id : null,
+        sellId: c.sell ? c.sell.id : null,
+        entry, shares, bid,
+        heldShares: c.heldShares,
+        offerPrice: c.sell ? Number(c.sell.price) : null,
+        committedKd: Number(committedKd.toFixed(2)),
+        workingKd: Number(atRiskKd.toFixed(2)),
+        unrealisedKd: (c.heldShares > 0 && bid != null)
+          ? Number((((bid - entry) * c.heldShares) / 1000).toFixed(3)) : null,
+        exit: exitPlan(c, bid == null ? null : { bid }),
+        postedMinutes: c.buy
+          ? Math.round((Date.now() - new Date(c.buy.posted_at).getTime()) / 60000) : null,
+      });
     }
   }
+
+  // Held first, then working orders; oldest first inside each.
+  tradingRows.sort((a, b) => (b.heldShares > 0 ? 1 : 0) - (a.heldShares > 0 ? 1 : 0)
+    || (b.postedMinutes || 0) - (a.postedMinutes || 0));
+
+  /*
+   * END OF SESSION. A day order cannot outlive the close.
+   *
+   * EQUIPMENT's buy sat at POSTED for 497 minutes — 09:55 to 18:12, five hours
+   * after the market shut. Nothing in the system could tell whether that was a
+   * fill nobody logged or an order that died, and the difference is an entire
+   * position. Past the close these are listed and the day is marked unclosable
+   * until each one is answered.
+   */
+  const sessionOver = minutesToClose(new Date()) <= 0;
+  const unresolved = sessionOver
+    ? openLegs.map((l) => ({
+        id: l.id, symbol: l.symbol, seq: l.seq, side: l.side,
+        price: Number(l.price), shares: Number(l.shares),
+        postedAt: l.posted_at,
+        minutes: Math.round((Date.now() - new Date(l.posted_at).getTime()) / 60000),
+      }))
+    : [];
 
   const alerts = buildAlerts(openLegs, screened, new Date(), positions, carriedFromPriorDays);
 
@@ -332,6 +429,9 @@ async function tick(tradingDay = kuwaitDay(), db = pool) {
     tradeable: screened.tradeable,
     demoted: screened.demoted,
     waiting: screened.waiting || [],
+    contextError: d.contextError || null,
+    trading: tradingRows,
+    unresolved,
     openLegs,
     positions,
     carried: carriedFromPriorDays.map((l) => ({
@@ -351,9 +451,17 @@ async function tick(tradingDay = kuwaitDay(), db = pool) {
       grossKd: Number((dayNetKd + dayCommKd).toFixed(3)),
       trips: dayTrips,
       deployedKd: Number(deployedKd.toFixed(2)),
-      freeKd: Number(Math.max(0, (d.trading.budgetKd || 0) - deployedKd).toFixed(2)),
+      // Posted buys are capital at risk, not capital spent. Separate line.
+      workingKd: Number(workingKd.toFixed(2)),
+      freeKd: Number(Math.max(0, (d.trading.budgetKd || 0) - deployedKd - workingKd).toFixed(2)),
+      // 238 x 3,500 = 833 KD went out against an 800 KD budget and nothing said
+      // a word. It says one now.
+      overBudgetKd: Number(Math.max(0, (deployedKd + workingKd) - (d.trading.budgetKd || 0)).toFixed(2)),
       openPositions: positions.length,
+      workingOrders: tradingRows.filter((t) => t.state === 'posted').length,
+      unrealisedKd: Number(tradingRows.reduce((a, t) => a + (t.unrealisedKd || 0), 0).toFixed(3)),
       legsRecorded: allLegs.length,
+      mustResolve: unresolved.length,
     },
   };
 }

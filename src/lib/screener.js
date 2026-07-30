@@ -89,6 +89,7 @@ function economics(row, slotKd, opts = {}) {
     trend: opts.trend || null,
     trendChangeFils: opts.trendChangeFils ?? null,
     gapPct: opts.gapPct ?? null,
+    postablePct: opts.postablePct ?? null,
     shares, notionalKd,
     bidQty, bidDepthKd,
     offerQty: num(row.offer_qty) || 0,
@@ -133,6 +134,18 @@ function verdict(e, screen = CFG.SCREEN, opts = {}) {
    */
   if (gapCfg.minTradesPerDay && e.trades < gapCfg.minTradesPerDay) {
     fail.push(`${Math.round(e.trades)} trades/day — below the ${gapCfg.minTradesPerDay} floor`);
+  }
+
+  /*
+   * GATE 2. How OFTEN the bid depth is right-sized for this slot, not whether
+   * it happens to be right now. The instantaneous queue check below still
+   * applies; this is the one that says whether the stock is postable at all.
+   */
+  if (gapCfg.minPostablePct != null && e.postablePct != null
+      && e.postablePct < gapCfg.minPostablePct) {
+    fail.push(`postable on only ${Math.round(e.postablePct)}% of ticks — ` +
+              `depth is right-sized for ${Math.round(e.postablePct)}% of the session, ` +
+              `needs ${gapCfg.minPostablePct}%`);
   }
 
   const moneyOk = e.netKd >= screen.minNetPerRoundTripKd;
@@ -248,6 +261,7 @@ function screen(rows, trading = CFG.TRADING, opts = {}) {
     const e = economics(r, slotKd, {
       ...opts, trend: t.trend || null, trendChangeFils: t.changeFils ?? null,
       gapPct: gaps.get(r.symbol) ?? null,
+      postablePct: (opts.postable instanceof Map ? opts.postable.get(r.symbol) : null)?.pct ?? null,
     });
     if (!e) continue;
     const v = verdict(e, opts.screen || CFG.SCREEN, opts);

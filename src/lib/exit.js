@@ -53,6 +53,25 @@ function costFloorFils(commissionRoundTripKd, shares) {
   return (commissionRoundTripKd * 1000) / shares;
 }
 
+/** Minutes past midnight, Kuwait (UTC+3). */
+function kuwaitMinutes(d = new Date()) {
+  const k = new Date(d.getTime() + 3 * 3600000);
+  return k.getUTCHours() * 60 + k.getUTCMinutes();
+}
+
+/**
+ * Past the step-down clock?
+ *
+ * This is a TIME OF DAY test, not an elapsed-time one. On 29 July the entry
+ * price 238 printed six times between 12:32 and 12:58 — a step-down at noon
+ * exits flat into one of those. By 12:50 the only choices left are the bid,
+ * which the rules forbid, or the auction.
+ */
+function pastStepDown(cfg, nowMinutes = kuwaitMinutes()) {
+  const at = String(cfg.stepDownAtClock || '12:00').split(':').map(Number);
+  return nowMinutes >= at[0] * 60 + (at[1] || 0);
+}
+
 /** The trail only ever moves up. */
 function trackPeak(prevPeak, bid) {
   const p = Number(prevPeak), b = Number(bid);
@@ -67,22 +86,34 @@ function trackPeak(prevPeak, bid) {
  * @param {number} entryPrice   fils you actually paid
  * @param {number} peakBid      highest bid seen since the fill (monotonic)
  * @param {number} currentBid   the bid this tick
- * @param {number} minutesHeld  since the buy filled
+ * @param {number} minutesHeld  since the buy filled (reporting only)
+ * @param {number} nowMinutes   minutes past midnight, Kuwait — drives the step-down
  * @param {number} floorFils    break-even move, from costFloorFils()
  * @param {object} cfg          CFG.EXIT
  *
  * @returns {{armFils, armed, peakBid, suggestedOffer, sellNow, reason, steppedDown}}
  */
-function suggestExit({ entryPrice, peakBid, currentBid, minutesHeld = 0, floorFils = 0, cfg }) {
+function suggestExit({ entryPrice, peakBid, currentBid, minutesHeld = 0,
+                      nowMinutes = kuwaitMinutes(), floorFils = 0, cfg }) {
   const entry = Number(entryPrice);
   if (!Number.isFinite(entry)) return null;
 
   const mode = cfg.mode || 'trailing';
   const trail = Number(cfg.trailFils ?? 1);
 
-  // The floor. Ceil to the tick grid — a half-fil floor is not postable.
+  /*
+   * The floor: the first tick that is STRICTLY PROFITABLE, not the one that
+   * breaks even.
+   *
+   * This was Math.ceil(floorFils), which is wrong whenever break-even lands
+   * exactly on a tick. EQUIPMENT: 3,500 at 238 costs 3.499 KD round trip, so
+   * break-even is 1.000 fils exactly; ceil gives 1 and the app recommended
+   * selling at 239 for a trip of +0.001 KD. That is not an exit, it is a free
+   * option handed to whoever lifts it. floor()+1 puts the arm on the first tick
+   * that actually pays — 240, worth +3.501.
+   */
   const armFils = cfg.respectCostFloor
-    ? Math.max(Number(cfg.armAtFils ?? 1), Math.ceil(floorFils))
+    ? Math.max(Number(cfg.armAtFils ?? 1), Math.floor(floorFils) + 1)
     : Number(cfg.armAtFils ?? 1);
 
   const floorPrice = entry + armFils;
@@ -105,12 +136,12 @@ function suggestExit({ entryPrice, peakBid, currentBid, minutesHeld = 0, floorFi
   if (!armed) {
     // Below the floor there is no selling — that floor is what clears
     // commission and the spread. Rule 1 of the hybrid exit.
-    const stepped = minutesHeld > Number(cfg.stepDownAfterMin ?? 45);
+    const stepped = pastStepDown(cfg, nowMinutes);
     return {
       armFils, armed: false, peakBid: peak, suggestedOffer: floorPrice,
       sellNow: false, steppedDown: stepped,
       reason: stepped
-        ? `unresolved ${Math.round(minutesHeld)} min — hold at the floor ${floorPrice}, take the smaller win`
+        ? `past ${cfg.stepDownAtClock || '12:00'} — hold at the floor ${floorPrice}, take the smaller win while prints are still coming`
         : `waiting to arm — needs ${floorPrice} (entry ${entry} + ${armFils})`,
     };
   }
@@ -121,7 +152,7 @@ function suggestExit({ entryPrice, peakBid, currentBid, minutesHeld = 0, floorFi
 
   // Step down: an armed position that has not resolved has been giving back
   // spread for 45 minutes. Drop to the floor and take the smaller win.
-  const steppedDown = minutesHeld > Number(cfg.stepDownAfterMin ?? 45);
+  const steppedDown = pastStepDown(cfg, nowMinutes);
   if (steppedDown) offer = floorPrice;
 
   // Fires on the FIRST downtick, not on confirmation.
@@ -130,11 +161,11 @@ function suggestExit({ entryPrice, peakBid, currentBid, minutesHeld = 0, floorFi
   return {
     armFils, armed: true, peakBid: peak, suggestedOffer: offer, sellNow, steppedDown,
     reason: steppedDown
-      ? `armed but unresolved ${Math.round(minutesHeld)} min — stepped down to ${floorPrice}`
+      ? `past ${cfg.stepDownAtClock || '12:00'} — stepped down to ${floorPrice}; after 12:50 only the bid or the auction remain`
       : sellNow
         ? `bid ${bid} hit the trail — sell into what is still there, do not wait`
         : `peak ${peak}, trailing ${trail} behind it at ${offer}`,
   };
 }
 
-module.exports = { costFloorFils, trackPeak, suggestExit };
+module.exports = { costFloorFils, trackPeak, suggestExit, kuwaitMinutes, pastStepDown };

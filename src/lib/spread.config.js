@@ -130,7 +130,14 @@ module.exports = {
   // stock is a pause; on a falling stock it is a hole.
   TREND: {
     enabled: true,
-    lookbackDays: 3,
+    /*
+     * 20+ SESSIONS, NOT 3. I built this at 3 and the BA brief is explicit that
+     * a four-day window is not a trend: ARGAN looked flat across four sessions
+     * while it had actually fallen 139 -> 119 over five weeks, including an
+     * 8-fil gap down on 14 July. A short window reads the noise inside a
+     * downtrend as calm and lets exactly the wrong stock through.
+     */
+    lookbackDays: 20,
     block: ['FALLING'],
     // Rank multiplier. netKd answers "is it worth it"; this answers "will it
     // come back to me". Ranking on netKd alone is what produced EMIRATES.
@@ -150,6 +157,18 @@ module.exports = {
   // 1-fil capture nets -0.06 KD, so the honest answer there is WAIT, not a
   // queued order the screen quietly presents as an opportunity.
   GAP: {
+    /*
+     * GATE 2 — postable queue. The single most-skipped gate.
+     *
+     * Your order wants to be 2-30% of the resting bid: under 2% you sit behind
+     * a wall, over 30% you ARE the book. What matters is how OFTEN that holds,
+     * not whether it holds right now — depth swings enormously minute to minute
+     * and the average is misleading. Below half the ticks in range, the stock
+     * is not reliably postable at this slot size.
+     */
+    minPostablePct: 50,
+    postableLowPct: 2,
+    postableHighPct: 30,
     minGapPct: 40,
     preferInside: true,
     allowQueuedEntry: false,
@@ -183,7 +202,15 @@ module.exports = {
     armAtFils: 1,
     trailFils: 1,
     hardTargetFils: null,    // no cap
-    stepDownAfterMin: 45,    // unresolved that long -> drop to the floor, take the smaller win
+    /*
+     * TIME OF DAY, NOT ELAPSED TIME. I built this as stepDownAfterMin: 45,
+     * which is wrong in a way the tape shows plainly: on 29 July the entry
+     * price 238 printed six times between 12:32 and 12:58. A step-down at noon
+     * exits flat into one of those prints. By 12:50 the only choices left are
+     * the bid — which you must never take — or the auction. Elapsed minutes
+     * cannot know that; the clock can.
+     */
+    stepDownAtClock: '12:00',
     // NOT IN THE CR, AND IT MATTERS. armAtFils: 1 can arm below break-even:
     // the CR itself shows a 1-fil capture at 800 KD on a 235-fil stock nets
     // -0.06 KD. Trailing out at +1 there books a loss. With this true the arm
