@@ -99,6 +99,12 @@ function suggestExit({ entryPrice, peakBid, currentBid, minutesHeld = 0,
   if (!Number.isFinite(entry)) return null;
 
   const mode = cfg.mode || 'trailing';
+  // What the trip is worth if it exits here: the move in fils, less the cost of
+  // the move in fils, times the size. Null when size is unknown.
+  const shares = Number(cfg.__shares ?? NaN);
+  const tripAt = (exitPx) => (Number.isFinite(shares) && shares > 0
+    ? Number((((exitPx - entry) - floorFils) * shares / 1000).toFixed(3))
+    : null);
   const trail = Number(cfg.trailFils ?? 1);
 
   /*
@@ -117,6 +123,14 @@ function suggestExit({ entryPrice, peakBid, currentBid, minutesHeld = 0,
     : Number(cfg.armAtFils ?? 1);
 
   const floorPrice = entry + armFils;
+
+  // The price at which the round trip exactly pays for itself. Shown beside the
+  // arm price on the screen: on the live position they are 239 and 240, and 239
+  // is worth +0.001 KD. Seeing both together is what stops the wrong one being
+  // posted — the engine itself recommended 239 until they sat side by side.
+  // Declared here, above the fixed-mode return, or that path reads it in the
+  // temporal dead zone.
+  const breakEvenPrice = entry + Math.ceil(floorFils);
   const peak = Number.isFinite(Number(peakBid)) ? Number(peakBid) : entry;
   const bid = Number.isFinite(Number(currentBid)) ? Number(currentBid) : peak;
 
@@ -125,8 +139,8 @@ function suggestExit({ entryPrice, peakBid, currentBid, minutesHeld = 0,
   if (mode === 'fixed') {
     const target = cfg.hardTargetFils != null ? entry + Number(cfg.hardTargetFils) : floorPrice;
     return {
-      armFils, armed: false, peakBid: peak, suggestedOffer: target,
-      sellNow: false, steppedDown: false,
+      armFils, armed: false, peakBid: peak, suggestedOffer: target, breakEvenPrice,
+      tripKd: tripAt(target), sellNow: false, steppedDown: false,
       reason: `fixed target ${target}`,
     };
   }
@@ -138,8 +152,8 @@ function suggestExit({ entryPrice, peakBid, currentBid, minutesHeld = 0,
     // commission and the spread. Rule 1 of the hybrid exit.
     const stepped = pastStepDown(cfg, nowMinutes);
     return {
-      armFils, armed: false, peakBid: peak, suggestedOffer: floorPrice,
-      sellNow: false, steppedDown: stepped,
+      armFils, armed: false, peakBid: peak, suggestedOffer: floorPrice, breakEvenPrice,
+      tripKd: tripAt(floorPrice), sellNow: false, steppedDown: stepped,
       reason: stepped
         ? `past ${cfg.stepDownAtClock || '12:00'} — hold at the floor ${floorPrice}, take the smaller win while prints are still coming`
         : `waiting to arm — needs ${floorPrice} (entry ${entry} + ${armFils})`,
@@ -159,7 +173,8 @@ function suggestExit({ entryPrice, peakBid, currentBid, minutesHeld = 0,
   const sellNow = bid <= offer && bid >= floorPrice;
 
   return {
-    armFils, armed: true, peakBid: peak, suggestedOffer: offer, sellNow, steppedDown,
+    armFils, armed: true, peakBid: peak, suggestedOffer: offer, breakEvenPrice,
+    tripKd: tripAt(offer), sellNow, steppedDown,
     reason: steppedDown
       ? `past ${cfg.stepDownAtClock || '12:00'} — stepped down to ${floorPrice}; after 12:50 only the bid or the auction remain`
       : sellNow

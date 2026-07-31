@@ -214,8 +214,38 @@ function verdict(e, screen = CFG.SCREEN, opts = {}) {
   const trendWeight = (trendCfg.expectedFilsByTrend || {})[e.trend] ?? 1;
   const rankScore = e.netKd * trendWeight;
 
+  /*
+   * THE GATES, AS DATA.
+   *
+   * Every row on the screen shows all four, passing or failing. Each of the
+   * three documented bad recommendations came from skipping exactly one —
+   * EMIRATES ranked on net while falling, KAMCO on gap frequency at 86 trades a
+   * day, MKHZN with a bid that is a wall 77% of the time. Emitting only the
+   * verdict would let the screen show winners without the reasoning that would
+   * have caught them, so the gates travel with the row.
+   */
+  const gates = [
+    { label: 'Net', ok: moneyOk,
+      value: Number.isFinite(e.netKd) ? `${e.netKd >= 0 ? '+' : '−'}${Math.abs(e.netKd).toFixed(2)}` : '—' },
+    { label: 'Queue', ok: e.postablePct == null ? queueOk : e.postablePct >= (gapCfg.minPostablePct ?? 0),
+      value: e.postablePct == null ? (queueOk ? 'ok' : 'wall') : `${Math.round(e.postablePct)}%` },
+    { label: 'Trend', ok: !blocked, value: e.trend ? e.trend.toLowerCase() : '—' },
+    { label: 'Trades', ok: !(gapCfg.minTradesPerDay && e.trades < gapCfg.minTradesPerDay),
+      value: `${Math.round(e.trades || 0)}/d` },
+  ];
+
+  // One list, in the order the screen reads them, so a row never shows a red
+  // pill with no matching sentence underneath it.
+  const reasons = [];
+  if (waitReason) reasons.push(waitReason);
+  if (trendReason) reasons.push(trendReason);
+  if (queueReason) reasons.push(queueReason);
+  for (const f of fail) reasons.push(f);
+
   return {
     state,
+    gates,
+    reasons,
     tradeable,
     moneyOk,
     queueOk,
@@ -223,7 +253,7 @@ function verdict(e, screen = CFG.SCREEN, opts = {}) {
     waitReason,
     trendReason,
     trendBlocked: !!blocked,
-    reasons: fail,
+    failures: fail,
     trendWeight,
     rankScore,
     // Money works, queue does not -> shown greyed rather than hidden. KHOT at

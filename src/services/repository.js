@@ -29,6 +29,7 @@
  * ============================================================================
  */
 const { pool } = require('../db');
+const CFG = require('../lib/spread.config');
 
 const DDL = `
 CREATE TABLE IF NOT EXISTS public.spread_orders (
@@ -130,6 +131,53 @@ CREATE TABLE IF NOT EXISTS public.spread_events (
   detail      jsonb
 );
 CREATE INDEX IF NOT EXISTS spread_events_day_idx ON public.spread_events (trading_day, at);
+
+/*
+ * THE CASH LEDGER — the account itself.
+ *
+ * budget_kd was a number typed into a box each morning. It had no history, it
+ * did not compound, and it bore no relation to the money actually held: the
+ * screen read "Free 800 KD" while the broker read 55.7450. Cash is now the sum
+ * of movements and buying power is cash. A profitable round trip raises it on
+ * its own; a fee, a loss or a withdrawal lowers it.
+ *
+ * Append-only. A mistake is corrected with an ADJUSTMENT row, never by editing
+ * history — otherwise the balance can be made to say anything.
+ *
+ * settles_on is NULL when proceeds are available immediately. If Boursa Kuwait
+ * turns out to be T+2 it carries the settlement date and buying power counts
+ * only rows that have settled. The column exists now so that answer is a config
+ * change rather than a migration.
+ */
+CREATE TABLE IF NOT EXISTS public.spread_cash (
+  id           bigserial PRIMARY KEY,
+  strategy     text        NOT NULL DEFAULT 'SPREAD',
+  at           timestamptz NOT NULL DEFAULT now(),
+  trading_day  date        NOT NULL,
+  kind         text        NOT NULL,   -- DEPOSIT | WITHDRAWAL | BUY | SELL | FEE | ADJUSTMENT
+  amount_kd    numeric     NOT NULL,   -- SIGNED. deposits and sells +, buys and fees −
+  order_id     bigint,
+  settles_on   date,
+  note         text
+);
+CREATE INDEX IF NOT EXISTS spread_cash_day_idx ON public.spread_cash (trading_day, at);
+CREATE INDEX IF NOT EXISTS spread_cash_order_idx ON public.spread_cash (order_id);
+
+/*
+ * A CLAIM is a stock you have taken off the board with an amount reserved, but
+ * for which no order exists and no cash has moved. It sits between "on the
+ * screener" and "order posted", and it stops the same money being offered to
+ * three stocks at once. Claims do not post to the ledger.
+ */
+CREATE TABLE IF NOT EXISTS public.spread_claims (
+  id           bigserial PRIMARY KEY,
+  trading_day  date        NOT NULL,
+  symbol       text        NOT NULL,
+  amount_kd    numeric     NOT NULL,
+  override     boolean     NOT NULL DEFAULT false,
+  at           timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (trading_day, symbol)
+);
 `;
 
 let ensured = false;
@@ -414,8 +462,10 @@ async function bumpPeak(id, bid, db = pool) {
  */
 let dailyCols = null;
 const DATE_CANDIDATES  = ['trade_date', 'price_date', 'quote_date', 'bar_date', 'date', 'day', 'dt', 'as_of'];
-const CLOSE_CANDIDATES = ['close', 'close_price', 'closing_price', 'price_close', 'last_price',
-                          'last', 'settle_price', 'adj_close', 'c'];
+// `day_close` is what this database actually uses — it is first because it is the
+// known-correct name here, not a guess. The rest stay as fallbacks.
+const CLOSE_CANDIDATES = ['day_close', 'close', 'close_price', 'closing_price', 'price_close',
+                          'last_price', 'last', 'settle_price', 'adj_close', 'c'];
 
 async function resolveDailyCols(db = pool) {
   if (dailyCols) return dailyCols;
@@ -428,9 +478,22 @@ async function resolveDailyCols(db = pool) {
   }
   const have = new Set(rows.map((r) => r.column_name));
   const pick = (list) => list.find((c) => have.has(c)) || null;
-  const dateCol = process.env.DAILY_DATE_COL || pick(DATE_CANDIDATES);
-  const closeCol = process.env.DAILY_CLOSE_COL || pick(CLOSE_CANDIDATES);
-  const symCol = have.has('symbol') ? 'symbol' : (have.has('ticker') ? 'ticker' : null);
+
+  // Env override, then the configured names, then discovery. The configured
+  // names are verified against the catalogue rather than trusted — a config
+  // that quietly disagrees with the database is worse than no config.
+  const cfg = CFG.DAILY || {};
+  const use = (envName, configured, candidates) => {
+    const fromEnv = process.env[envName];
+    if (fromEnv && have.has(fromEnv)) return fromEnv;
+    if (fromEnv) console.warn(`[spread] ${envName}="${fromEnv}" is not a column on stock_prices_daily — ignoring`);
+    if (configured && have.has(configured)) return configured;
+    return pick(candidates);
+  };
+  const dateCol = use('DAILY_DATE_COL', cfg.date, DATE_CANDIDATES);
+  const closeCol = use('DAILY_CLOSE_COL', cfg.close, CLOSE_CANDIDATES);
+  const symCol = (cfg.symbol && have.has(cfg.symbol)) ? cfg.symbol
+    : (have.has('symbol') ? 'symbol' : (have.has('ticker') ? 'ticker' : null));
 
   if (!dateCol || !closeCol || !symCol) {
     const e = new Error(
@@ -564,6 +627,158 @@ async function legsForContractsTouching(tradingDay, symbol, db = pool) {
              OR COALESCE(carried_from_day, trading_day) IN (SELECT ckey FROM k))
       ORDER BY seq, posted_at;`, [tradingDay, sym]);
   return rows;
+}
+
+const CASH_KINDS = new Set(['DEPOSIT', 'WITHDRAWAL', 'BUY', 'SELL', 'FEE', 'ADJUSTMENT']);
+
+/** Post one cash movement. Never call this outside a transaction that owns the leg. */
+async function recordCash(m, db = pool) {
+  await ensure(db);
+  const kind = String(m.kind || '').toUpperCase();
+  if (!CASH_KINDS.has(kind)) {
+    const e = new Error(`cash kind must be one of ${[...CASH_KINDS].join('/')}, got "${m.kind}"`);
+    e.code = 'BAD_LEG'; throw e;
+  }
+  const amt = Number(m.amountKd);
+  if (!Number.isFinite(amt)) {
+    const e = new Error(`amount must be a number, got "${m.amountKd}"`); e.code = 'BAD_LEG'; throw e;
+  }
+  const { rows } = await db.query(
+    `INSERT INTO public.spread_cash (trading_day, kind, amount_kd, order_id, settles_on, note)
+     VALUES ($1,$2,$3,$4,$5,$6) RETURNING *;`,
+    [m.tradingDay, kind, amt, m.orderId ?? null, m.settlesOn ?? null, m.note ?? null]);
+  return rows[0];
+}
+
+/**
+ * Cash movements for a fill, posted atomically with the leg.
+ *
+ * A fill that does not move cash is the same class of bug as a fill that does
+ * not save — the balance silently stops matching the broker and nothing says so.
+ * Two rows per fill: the notional, and the fee. POSTED, CANCELLED and EXPIRED
+ * legs post nothing, because no money moved.
+ */
+async function postFillCash(leg, db = pool) {
+  if (String(leg.status).toUpperCase() !== 'FILLED') return [];
+  const isBuy = String(leg.side).toUpperCase() === 'BUY';
+  const notional = (Number(leg.price) * Number(leg.shares)) / 1000;
+  const out = [];
+  out.push(await recordCash({
+    tradingDay: leg.trading_day, kind: isBuy ? 'BUY' : 'SELL',
+    amountKd: isBuy ? -notional : notional, orderId: leg.id,
+    note: `${leg.symbol} ${Number(leg.shares).toLocaleString()} @ ${leg.price}`,
+  }, db));
+  const fee = Number(leg.commission_kd || 0);
+  if (fee > 0) {
+    out.push(await recordCash({
+      tradingDay: leg.trading_day, kind: 'FEE', amountKd: -fee, orderId: leg.id,
+      note: `${leg.symbol} ${isBuy ? 'buy' : 'sell'} commission`,
+    }, db));
+  }
+  return out;
+}
+
+/** Remove the cash a leg posted — used when a leg is edited or deleted. */
+async function reverseFillCash(orderId, db = pool) {
+  await ensure(db);
+  await db.query('DELETE FROM public.spread_cash WHERE order_id = $1;', [orderId]);
+}
+
+/** The ledger with a running balance. */
+async function cashLedger(fromDay, toDay, db = pool) {
+  await ensure(db);
+  const { rows } = await db.query(
+    `SELECT *, sum(amount_kd) OVER (ORDER BY at, id) AS balance_kd
+       FROM public.spread_cash
+      ORDER BY at, id;`);
+  return rows.filter((r) => !fromDay || (r.trading_day >= fromDay && (!toDay || r.trading_day <= toDay)));
+}
+
+/**
+ * Everything the account screens show, derived. Nothing here is stored.
+ *
+ * EQUITY IS NOT BUYING POWER. Holding 1,495 KD of equity with 826 of it in a
+ * position means exactly 669.23 can be withdrawn or deployed, and a refusal has
+ * to be able to say which.
+ */
+async function accountSummary(asOfDay, db = pool) {
+  await ensure(db);
+  const { rows: [c] } = await db.query(
+    `SELECT
+       COALESCE(sum(amount_kd),0)                                                    AS cash_kd,
+       COALESCE(sum(amount_kd) FILTER (WHERE settles_on IS NULL OR settles_on <= $1),0) AS settled_kd,
+       COALESCE(sum(amount_kd) FILTER (WHERE kind IN ('DEPOSIT','WITHDRAWAL')),0)     AS net_deposited_kd,
+       COALESCE(sum(amount_kd) FILTER (WHERE kind = 'DEPOSIT'),0)                     AS deposits_kd,
+       COALESCE(sum(amount_kd) FILTER (WHERE kind = 'WITHDRAWAL'),0)                  AS withdrawals_kd,
+       COALESCE(sum(amount_kd) FILTER (WHERE kind = 'FEE'),0)                         AS commission_kd,
+       count(*) FILTER (WHERE kind = 'FEE')                                           AS fee_count
+     FROM public.spread_cash;`, [asOfDay]);
+
+  const open = await openPositions(asOfDay, db);
+  const { rows: marks } = await db.query(
+    `SELECT DISTINCT ON (symbol) symbol, bid FROM public.stock_quotes
+      WHERE bid > 0 ORDER BY symbol, created_at DESC;`);
+  const bidBy = new Map(marks.map((m) => [m.symbol, Number(m.bid)]));
+
+  let investedKd = 0, marketKd = 0;
+  for (const p of open) {
+    const sh = Number(p.shares), px = Number(p.price);
+    investedKd += (px * sh) / 1000;
+    const bid = bidBy.has(p.symbol) ? bidBy.get(p.symbol) : px;
+    marketKd += (bid * sh) / 1000;
+  }
+
+  const { rows: [cl] } = await db.query(
+    `SELECT COALESCE(sum(amount_kd),0) AS claimed_kd, count(*) AS n
+       FROM public.spread_claims WHERE trading_day = $1;`, [asOfDay]);
+
+  const n = (v, d = 3) => Number(Number(v).toFixed(d));
+  return {
+    cashKd: n(c.cash_kd), settledKd: n(c.settled_kd),
+    buyingPowerKd: n(c.settled_kd),
+    netDepositedKd: n(c.net_deposited_kd), depositsKd: n(c.deposits_kd),
+    withdrawalsKd: n(c.withdrawals_kd), commissionKd: n(c.commission_kd),
+    feeCount: Number(c.fee_count),
+    investedKd: n(investedKd), marketKd: n(marketKd),
+    equityKd: n(Number(c.cash_kd) + marketKd),
+    claimedKd: n(cl.claimed_kd), claims: Number(cl.n),
+    openPositions: open.length,
+  };
+}
+
+/* ------------------------------------------------------------------ claims */
+async function listClaims(tradingDay, db = pool) {
+  await ensure(db);
+  const { rows } = await db.query(
+    'SELECT * FROM public.spread_claims WHERE trading_day = $1 ORDER BY at;', [tradingDay]);
+  return rows;
+}
+
+async function addClaim(tradingDay, symbol, amountKd, override, db = pool) {
+  await ensure(db);
+  const sym = String(symbol || '').trim().toUpperCase();
+  if (!sym) { const e = new Error('symbol is required'); e.code = 'BAD_LEG'; throw e; }
+  const amt = Number(amountKd);
+  if (!Number.isFinite(amt) || amt <= 0) {
+    const e = new Error(`amount must be a positive number, got "${amountKd}"`); e.code = 'BAD_LEG'; throw e;
+  }
+  const { rows } = await db.query(
+    `INSERT INTO public.spread_claims (trading_day, symbol, amount_kd, override)
+     VALUES ($1,$2,$3,$4)
+     ON CONFLICT (trading_day, symbol) DO UPDATE SET amount_kd = $3, override = $4, at = now()
+     RETURNING *;`, [tradingDay, sym, amt, !!override]);
+  await logEvent({ tradingDay, symbol: sym, action: 'CLAIM', detail: rows[0] }, db);
+  return rows[0];
+}
+
+async function removeClaim(tradingDay, symbol, db = pool) {
+  await ensure(db);
+  const sym = String(symbol || '').trim().toUpperCase();
+  const { rows } = await db.query(
+    'DELETE FROM public.spread_claims WHERE trading_day = $1 AND symbol = $2 RETURNING *;',
+    [tradingDay, sym]);
+  if (rows[0]) await logEvent({ tradingDay, symbol: sym, action: 'UNCLAIM', detail: rows[0] }, db);
+  return rows[0] || null;
 }
 
 /** The timestamped action log for a day. Backend/analysis only. */
@@ -785,6 +1000,8 @@ module.exports = {
   nextSeq, recordLeg, resolveLeg, updateLeg, deleteLeg, legById,
   legsForDay, legsForContractsTouching, openLegs, eventsForDay,
   openPositions, setCarryState, bumpPeak, trendMap, gapMap, postableMap, resolveDailyCols,
+  recordCash, postFillCash, reverseFillCash, cashLedger, accountSummary,
+  listClaims, addClaim, removeClaim,
   writeSnapshot, snapshotAt, snapshotTimes,
   pnlByDay, pnlBySymbol, executionStats, unrealised,
   activeConfig, saveConfig,

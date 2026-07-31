@@ -385,6 +385,36 @@ async function tick(tradingDay = kuwaitDay(), db = pool) {
 
   const alerts = buildAlerts(openLegs, screened, new Date(), positions, carriedFromPriorDays);
 
+  /*
+   * THE ACCOUNT. Derived from the cash ledger, never typed.
+   *
+   * budgetKd used to be a number in spread_config that somebody retyped each
+   * morning, silently absorbing every profit and loss along the way. Buying
+   * power is now the settled cash balance and it compounds by itself.
+   */
+  const account = await repo.accountSummary(tradingDay, db)
+    .catch((e) => { console.warn('[spread] accountSummary:', e.message); return null; });
+
+  // Claims: taken off the board, amount reserved, no order, no cash moved.
+  const claims = await repo.listClaims(tradingDay, db).catch(() => []);
+  for (const c of claims) {
+    if (tradingRows.some((t) => t.symbol === c.symbol)) continue;
+    const row = screened.tradeable.concat(screened.demoted, screened.waiting || [])
+      .find((r) => r.symbol === c.symbol) || null;
+    tradingRows.unshift({
+      symbol: c.symbol, seq: null, state: 'picked', carried: false,
+      claimedKd: Number(Number(c.amount_kd).toFixed(2)), override: c.override,
+      entry: row ? row.entryPrice : null, shares: 0, heldShares: 0,
+      bid: row ? row.bid : null, committedKd: 0, unrealisedKd: null,
+      suggested: row ? {
+        price: row.entryPrice, shares: row.shares,
+        costKd: Number(row.notionalKd.toFixed(2)),
+        roundTripKd: Number(row.roundTripKd.toFixed(3)),
+        netKd: Number(row.netKd.toFixed(3)),
+      } : null,
+    });
+  }
+
   // Storage decision — display already has everything.
   // queueSharePct is Infinity when the bid side is empty; toFixed keeps it and
   // JSON turns it into null downstream. Normalise here so one code path decides.
@@ -427,8 +457,13 @@ async function tick(tradingDay = kuwaitDay(), db = pool) {
     ceilingFils: screened.ceilingFils,
     scanned: screened.scanned,
     tradeable: screened.tradeable,
+    // The screen calls this `rejected` because that is what it is: everything
+    // that did not pass, with the failing gate on the row. `demoted` is kept so
+    // an older client does not blank out mid-deploy.
+    rejected: [...(screened.waiting || []), ...screened.demoted],
     demoted: screened.demoted,
     waiting: screened.waiting || [],
+    account,
     contextError: d.contextError || null,
     trading: tradingRows,
     unresolved,
@@ -582,7 +617,9 @@ function exitPlan(contract, book, cfg = CFG.EXIT) {
     currentBid: bid,
     minutesHeld,
     floorFils: EXIT.costFloorFils(commRoundTrip, shares),
-    cfg,
+    // Size travels with the config so the module can price the trip without
+    // taking a second argument nobody would remember to pass.
+    cfg: { ...cfg, __shares: shares },
   });
 }
 
@@ -625,10 +662,22 @@ async function detail(symbol, tradingDay = kuwaitDay(), db = pool) {
   // Carried first. They are the capital that is already committed.
   withPlans.sort((a, b) => (b.carried ? 1 : 0) - (a.carried ? 1 : 0) || a.seq - b.seq);
 
+  // The step-down is a time of day, so the page can say how long is left rather
+  // than making someone read a clock and subtract.
+  const stepAt = String(CFG.EXIT.stepDownAtClock || '12:00');
+  const [sh, sm] = stepAt.split(':').map(Number);
+  const nowMin = EXIT.kuwaitMinutes();
+  const leftMin = sh * 60 + (sm || 0) - nowMin;
+  const stepDownIn = leftMin > 0
+    ? `in ${Math.floor(leftMin / 60)}h ${String(leftMin % 60).padStart(2, '0')}m`
+    : 'passed';
+
   return {
     ...ins,
     symbol: sym,
     tradingDay,
+    stepDownAtClock: stepAt,
+    stepDownIn,
     contracts: withPlans,
     nextSeq,
     openSeq: openContract ? openContract.seq : null,

@@ -112,6 +112,26 @@ module.exports = {
     priceMovedFromSuggestion: true,
   },
 
+  /*
+   * Where the daily bars live.
+   *
+   * stock_prices_daily belongs to the TMI engine — it carries fib_signals,
+   * bull_swings, auto_target_fils and so on. SPREAD borrows three columns from
+   * it and nothing else. These are the KNOWN-CORRECT names for this database,
+   * verified against information_schema, not guesses: I shipped `close` from
+   * memory and it does not exist here.
+   *
+   * Order of precedence: env override, then this block, then discovery from the
+   * catalogue. Discovery exists so a schema change degrades to a warning rather
+   * than a silent dead rule.
+   */
+  DAILY: {
+    table: 'stock_prices_daily',
+    symbol: 'symbol',
+    date: 'trade_date',
+    close: 'day_close',
+  },
+
   // ---- CR-12. Direction. ------------------------------------------------
   // The screener ranked on netKd alone and had no view of price direction. On
   // 28-Jul it put EMIRATES top at +8.22 KD/trip; replayed honestly against the

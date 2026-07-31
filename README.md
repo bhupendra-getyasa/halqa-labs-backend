@@ -432,3 +432,65 @@ under half its ticks.
 - The scraper took 810 rows on 29 July against ~30,000 expected.
 - `stock_quotes` rolls at 12 days. Queue position is the variable that decides
   whether trades fill, and a fortnight of it is all that exists.
+
+---
+
+## v5 — the funded account, and closing the frontend/backend gap
+
+An audit of what the screens read against what the server emitted found five
+missing handlers and eleven missing fields. All closed.
+
+### The cash ledger replaces budget_kd
+
+`spread_cash` is append-only: DEPOSIT, WITHDRAWAL, BUY, SELL, FEE, ADJUSTMENT.
+Everything the account screens show is derived from it and nothing is stored as
+a total.
+
+```
+cash          = sum(amount_kd)
+buying power  = sum WHERE settles_on IS NULL OR settles_on <= today
+invested      = open positions at cost
+market value  = open positions at the bid
+equity        = cash + market value
+```
+
+**The money moves with the leg.** `postFillCash()` writes two rows per fill —
+the notional and the fee — and resolve, edit and delete reverse and repost. A
+fill that does not post cash is the same class of bug as a fill that does not
+save: the balance quietly stops matching the broker and nothing says so.
+
+POSTED, CANCELLED and EXPIRED legs post nothing. No money moved.
+
+Verified end to end: 1000 deposited → buy 4,500 AQAR at 111 → **499.251** →
+sell at 112 → **1001.995**. The +1.995 compounds into buying power with nobody
+typing a budget.
+
+### Claims
+
+`spread_claims` — a stock taken off the board with an amount reserved, no order,
+no cash movement. It stops the same 669 KD being offered to three stocks at
+once. Refusing says *"only 402.00 KD of buying power is free — equity is 1002.00
+but 0.00 is in an open position"*, because "insufficient funds" against a
+four-figure account reads like a bug.
+
+### Gates travel with the row
+
+`screener.verdict()` now emits a `gates` array — Net, Queue, Trend, Trades —
+each with pass/fail and its value, plus one ordered `reasons` list. Emitting only
+the verdict would let the screen show winners without the reasoning that would
+have caught EMIRATES, KAMCO and MKHZN.
+
+### Also added
+
+- `exit.breakEvenPrice` and `exit.tripKd`, so the page can show 239 and 240 side
+  by side and make the +0.001 trade visibly wrong.
+- `detail.stepDownIn` — the countdown in words.
+- `view.rejected` (waiting + demoted), `view.account`, `spread:inspected`.
+
+### A bug this found
+
+`breakEvenPrice` was declared after the fixed-mode early return, so that path
+read it in the temporal dead zone and threw. Caught by the CR suite on the first
+run after the change.
+
+**Backend: 74 socket + 41 CR checks. Frontend: 51 render checks.**

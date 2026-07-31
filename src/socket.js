@@ -115,6 +115,24 @@ function registerSpreadHandlers(io, socket) {
     try {
       const detail = await svc.detail(symbol, day);
       socket.emit('spread:detail', { detail });
+      // The list shows the search result inline, with its gates and the reason
+      // it was left off, so a symbol can be judged without leaving the page.
+      if (action === 'inspect') {
+        socket.emit('spread:inspected', {
+          inspected: detail.economics ? {
+            symbol: detail.symbol, bid: detail.economics.bid, spread: detail.economics.spread,
+            trades: detail.economics.trades, entryPlacement: detail.economics.entryPlacement,
+            gates: detail.verdict?.gates || [], reasons: detail.verdict?.reasons || [],
+            tradeable: !!detail.verdict?.tradeable,
+            suggested: {
+              price: detail.economics.entryPrice, shares: detail.economics.shares,
+              costKd: Number(detail.economics.notionalKd.toFixed(2)),
+              roundTripKd: Number(detail.economics.roundTripKd.toFixed(3)),
+              netKd: Number(detail.economics.netKd.toFixed(3)),
+            },
+          } : { symbol: detail.symbol, gates: [], reasons: ['no quote for this symbol today'], tradeable: false },
+        });
+      }
       if (typeof ack === 'function') ack({ ok: true, detail });
     } catch (e) { fail(ack, action, e); }
   };
@@ -160,6 +178,20 @@ function registerSpreadHandlers(io, socket) {
         await repo.bumpPeak(saved.id, Number(leg.price)).catch(() => {});
       }
 
+      /*
+       * THE MONEY MOVES WITH THE LEG.
+       *
+       * A fill that does not post cash is the same class of bug as a fill that
+       * does not save — the balance quietly stops matching the broker and
+       * nothing says so. This throws rather than warns: a leg whose cash failed
+       * is worse than no leg at all, because the P&L then reads as if the trade
+       * were free.
+       */
+      await repo.postFillCash(saved, undefined);
+
+      // A claim is spent the moment the order exists.
+      await repo.removeClaim(day, symbol).catch(() => {});
+
       reply(ack, 'leg', {
         ok: true, order: saved,
         message: `C${saved.seq} ${saved.side} ${saved.price} × ${Number(saved.shares).toLocaleString()} saved (${saved.status})`,
@@ -197,6 +229,10 @@ function registerSpreadHandlers(io, socket) {
         : 0;
 
       updated = await repo.resolveLeg(id, st, resolvedAt, { price: px, shares: sh, commissionKd });
+      // Resolving is where a POSTED order becomes real money — or stops being a
+      // possibility. Either way the ledger has to agree with the leg.
+      await repo.reverseFillCash(id).catch(() => {});
+      await repo.postFillCash(updated).catch((e) => console.warn('[spread] cash on resolve:', e.message));
       reply(ack, 'resolve', {
         ok: true, order: updated,
         message: `C${updated.seq} ${updated.side} → ${updated.status}`,
@@ -228,6 +264,9 @@ function registerSpreadHandlers(io, socket) {
           : 0;
       }
       updated = await repo.updateLeg(id, patch);
+      // A correction to a FILLED leg rewrites the P&L, so it rewrites the cash.
+      await repo.reverseFillCash(id).catch(() => {});
+      await repo.postFillCash(updated).catch((e) => console.warn('[spread] cash on edit:', e.message));
       reply(ack, 'edit', { ok: true, order: updated, message: `C${updated.seq} ${updated.side} updated` });
     } catch (e) {
       return fail(ack, 'edit', e);
@@ -241,6 +280,7 @@ function registerSpreadHandlers(io, socket) {
     let removed = null;
     try {
       removed = await repo.deleteLeg(id);
+      await repo.reverseFillCash(id).catch(() => {});
       reply(ack, 'delete', { ok: true, order: removed, message: `C${removed.seq} ${removed.side} removed` });
     } catch (e) { return fail(ack, 'delete', e); }
     try {
@@ -278,13 +318,14 @@ function registerSpreadHandlers(io, socket) {
         const { commissionKd, notionalKd } = commissionFor({
           price: px, shares: row.shares, market: row.market, day,
         });
-        await repo.recordLeg({
+        const sellLeg = await repo.recordLeg({
           tradingDay: day, symbol: row.symbol, seq: row.seq, side: 'SELL', status: 'FILLED',
           price: px, shares: row.shares, postedAt: new Date(), resolvedAt: new Date(),
           market: row.market, commissionKd, notionalKd,
           carriedFromDay: ckey, exitVenue: 'AUCTION', entryMode: 'MANUAL',
           note: 'closing auction',
         });
+        await repo.postFillCash(sellLeg);
         reply(ack, 'auction', { ok: true, order: row,
           message: `C${row.seq} closed in the auction at ${px}` });
       }
@@ -316,6 +357,94 @@ function registerSpreadHandlers(io, socket) {
       socket.emit('spread:detail', { detail: await svc.detail(row.symbol || symbol, day) });
       io.to(room(day)).emit('spread:update', { view: await svc.tick(day) });
     } catch (e) { console.warn('[spread] refresh after carry:', e.message); }
+  });
+
+  /* ------------------------------------------------------------ the account */
+
+  socket.on('spread:cash', async ({ fromDay, toDay } = {}) => {
+    try {
+      const day = toDay || svc.kuwaitDay();
+      const [ledger, account, pnl] = await Promise.all([
+        repo.cashLedger(fromDay || null, day),
+        repo.accountSummary(day),
+        repo.pnlByDay('2026-07-01', day).catch(() => []),
+      ]);
+      socket.emit('spread:cash', {
+        ...account,
+        ledger,
+        realisedKd: Number(pnl.reduce((a, r) => a + Number(r.net_kd || 0), 0).toFixed(3)),
+        trips: pnl.reduce((a, r) => a + Number(r.trips || 0), 0),
+      });
+    } catch (e) { socket.emit('spread:error', { message: e.message, action: 'cash' }); }
+  });
+
+  const move = (kind) => async ({ amountKd, note, date } = {}, ack) => {
+    const day = date || svc.kuwaitDay();
+    try {
+      const amt = Number(amountKd);
+      if (!Number.isFinite(amt) || amt <= 0) throw bad('amount must be a positive number');
+
+      if (kind === 'WITHDRAWAL') {
+        /*
+         * EQUITY IS NOT BUYING POWER. Holding 1,495 KD with 826 of it in a
+         * position means exactly 669.23 can leave, and refusing has to say so —
+         * "insufficient funds" against a 1,495 KD account reads like a bug.
+         */
+        const a = await repo.accountSummary(day);
+        if (amt > a.settledKd) {
+          throw bad(`only ${a.settledKd.toFixed(2)} KD is available — equity is ` +
+                    `${a.equityKd.toFixed(2)} but ${a.investedKd.toFixed(2)} is in an open position`);
+        }
+      }
+
+      const row = await repo.recordCash({
+        tradingDay: day, kind, amountKd: kind === 'DEPOSIT' ? amt : -amt, note: note || null,
+      });
+      const a = await repo.accountSummary(day);
+      reply(ack, kind.toLowerCase(), {
+        ok: true, order: row,
+        message: `${kind === 'DEPOSIT' ? 'Added' : 'Withdrew'} ${amt.toFixed(2)} KD — ` +
+                 `buying power is now ${a.buyingPowerKd.toFixed(2)}`,
+      });
+      socket.emit('spread:cash', { ...a, ledger: await repo.cashLedger(null, day) });
+      io.to(room(day)).emit('spread:update', { view: await svc.tick(day) });
+    } catch (e) { fail(ack, kind.toLowerCase(), e); }
+  };
+  socket.on('spread:deposit', move('DEPOSIT'));
+  socket.on('spread:withdraw', move('WITHDRAWAL'));
+
+  /*
+   * A claim reserves buying power without placing anything. It is what stops the
+   * same 669 KD being offered to three stocks at once, and it is deliberately
+   * NOT a cash movement — no order exists yet.
+   */
+  socket.on('spread:claim', async ({ symbol, amountKd, override, date } = {}, ack) => {
+    const day = date || svc.kuwaitDay();
+    try {
+      const amt = Number(amountKd);
+      const a = await repo.accountSummary(day);
+      const free = a.buyingPowerKd - a.claimedKd;
+      if (!Number.isFinite(amt) || amt <= 0) throw bad('amount must be a positive number');
+      if (amt > free) {
+        throw bad(`only ${free.toFixed(2)} KD of buying power is free — equity is ` +
+                  `${a.equityKd.toFixed(2)} but ${a.investedKd.toFixed(2)} is in an open position`);
+      }
+      const row = await repo.addClaim(day, symbol, amt, override);
+      reply(ack, 'claim', { ok: true, order: row,
+        message: `${row.symbol} claimed for ${amt.toFixed(2)} KD — nothing placed yet` });
+      io.to(room(day)).emit('spread:update', { view: await svc.tick(day) });
+    } catch (e) { fail(ack, 'claim', e); }
+  });
+
+  socket.on('spread:unclaim', async ({ symbol, date } = {}, ack) => {
+    const day = date || svc.kuwaitDay();
+    try {
+      const row = await repo.removeClaim(day, symbol);
+      if (!row) throw bad(`${symbol} is not claimed`);
+      reply(ack, 'unclaim', { ok: true, order: row,
+        message: `${row.symbol} released — ${Number(row.amount_kd).toFixed(2)} KD back to buying power` });
+      io.to(room(day)).emit('spread:update', { view: await svc.tick(day) });
+    } catch (e) { fail(ack, 'unclaim', e); }
   });
 
   socket.on('spread:history', async ({ date } = {}) => {
