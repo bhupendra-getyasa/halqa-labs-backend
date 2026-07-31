@@ -2,7 +2,7 @@
   "name": "spread-backend",
   "version": "1.0.0",
   "private": true,
-  "description": "SPREAD \u2014 passive market-making engine for Boursa Kuwait",
+  "description": "SPREAD — passive market-making engine for Boursa Kuwait",
   "main": "src/index.js",
   "scripts": {
     "start": "node src/index.js",
@@ -17,6 +17,7 @@
   },
   "dependencies": {
     "cors": "^2.8.5",
+    "crypto": "^1.0.1",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
     "pg": "^8.12.0",
