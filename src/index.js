@@ -14,6 +14,7 @@ require('dotenv').config();
  */
 const http = require('http');
 const express = require('express');
+const crypto = require('crypto');
 const cors = require('cors');
 const { Server } = require('socket.io');
 
@@ -36,6 +37,52 @@ const DB_COLUMNS = [
   'open_price', 'high_price', 'low_price', 'session', 'nms',
   'trading_date', 'created_at',
 ];
+
+// ── market depth (order book) ─────────────────────────────────────────────────
+const DEPTH_COLUMNS = [
+  'scrape_batch_id', 'symbol', 'code', 'description', 'level',
+  'bid_price', 'bid_qty', 'offer_price', 'offer_qty',
+  'captured_at', 'trading_date', 'created_at',
+];
+// Accepts flat rows: {symbol, code, description, level, bidPrice, bidQty, offerPrice, offerQty}
+async function saveDepth(records) {
+  if (!records || !records.length) return { inserted: 0, received: 0 };
+  const batchId = crypto.randomUUID();
+  const createdAt = new Date().toISOString();
+  const tradingDate = kuwaitDate();
+  const client = await pool.connect();
+  let inserted = 0;
+  try {
+    await client.query('BEGIN');
+    const cols = DEPTH_COLUMNS.join(', ');
+    const CHUNK = 500;
+    for (let i = 0; i < records.length; i += CHUNK) {
+      const chunk = records.slice(i, i + CHUNK);
+      const values = [];
+      const tuples = chunk.map((r, ri) => {
+        const row = [
+          batchId, r.symbol || null, r.code || null, r.description || null, r.level != null ? r.level : null,
+          num(r.bidPrice), num(r.bidQty), num(r.offerPrice), num(r.offerQty),
+          r.capturedAt || createdAt, tradingDate, createdAt,
+        ];
+        const ph = row.map((_, ci) => `$${ri * DEPTH_COLUMNS.length + ci + 1}`);
+        values.push(...row);
+        return `(${ph.join(', ')})`;
+      });
+      const sql = `INSERT INTO stock_depth (${cols}) VALUES ${tuples.join(', ')} ` +
+                  `ON CONFLICT (symbol, level, created_at) DO NOTHING`;
+      const res = await client.query(sql, values);
+      inserted += res.rowCount;
+    }
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+  return { inserted, received: records.length };
+}
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 function num(v, signed = false) {
@@ -267,6 +314,63 @@ app.post('/quotes', async (req, res) => {
     console.error('save failed:', e.message);
     res.status(500).json({ error: e.message });
   }
+});
+
+let lastDepth = null;
+app.post('/depth', async (req, res) => {
+  try {
+    if (AUTH_TOKEN && (req.body?.token !== AUTH_TOKEN)) return res.status(401).json({ error: 'unauthorized' });
+    const records = Array.isArray(req.body?.records) ? req.body.records : [];
+    const out = await saveDepth(records);
+    lastDepth = { at: new Date().toISOString(), ...out };
+    console.log(`[${lastDepth.at}] DEPTH received ${out.received}, inserted ${out.inserted}`);
+    res.json(out);
+  } catch (e) {
+    console.error('depth save failed:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── depth watchlist: which symbols to capture the order book for ──────────────
+app.get('/depth-symbols', async (req, res) => {
+  try {
+    const today = String(req.query.today || '') === '1';
+    const q = today
+      ? `SELECT symbol, code FROM depth_watchlist WHERE active = true AND trading_date = (now() AT TIME ZONE 'Asia/Kuwait')::date ORDER BY symbol`
+      : `SELECT symbol, code FROM depth_watchlist WHERE active = true ORDER BY symbol`;
+    const r = await pool.query(q);
+    res.json({ symbols: r.rows });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/depth-symbols', async (req, res) => {
+  try {
+    if (AUTH_TOKEN && (req.body?.token !== AUTH_TOKEN)) return res.status(401).json({ error: 'unauthorized' });
+    const syms = Array.isArray(req.body?.symbols) ? req.body.symbols : [];
+    const date = req.body?.date || null;   // optional 'YYYY-MM-DD'; default = today (Kuwait)
+    let n = 0;
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      for (const s of syms) {
+        const sym = String((s && s.symbol != null) ? s.symbol : s).trim();
+        if (!sym) continue;
+        const code = (s && s.code != null) ? String(s.code).trim() : null;
+        if (date) {
+          await client.query(
+            `INSERT INTO depth_watchlist (symbol, code, trading_date, active) VALUES ($1,$2,$3,true)
+             ON CONFLICT (symbol, trading_date) DO UPDATE SET active = true, code = EXCLUDED.code`, [sym, code, date]);
+        } else {
+          await client.query(
+            `INSERT INTO depth_watchlist (symbol, code, active) VALUES ($1,$2,true)
+             ON CONFLICT (symbol, trading_date) DO UPDATE SET active = true, code = EXCLUDED.code`, [sym, code]);
+        }
+        n++;
+      }
+      await client.query('COMMIT');
+    } catch (e) { await client.query('ROLLBACK'); throw e; } finally { client.release(); }
+    res.json({ ok: true, upserted: n });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 const server = http.createServer(app);
