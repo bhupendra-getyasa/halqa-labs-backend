@@ -164,15 +164,33 @@ function verdict(e, screen = CFG.SCREEN, opts = {}) {
    * Size still matters on the way out, so the upper test is kept for both:
    * the depth beneath you is what you have to sell back into.
    */
-  let queueReason = null;
-  const exitSharePct = e.bidDepthKd > 0 ? (100 * e.notionalKd) / e.bidDepthKd : Infinity;
+  /*
+   * THE QUEUE GATE READS DIFFERENTLY BY PLACEMENT.
+   *
+   * The band is 5-30% of the resting bid — under 5% you are behind a wall,
+   * over 30% you ARE the book. But posting INSIDE the gap at bid+1 tick puts
+   * nobody ahead of you, so queue share against the bid is ZERO by construction.
+   * That is the best case on the board, not a failure, and applying the lower
+   * bound to it rejects exactly the setup CR-13 exists to prefer.
+   *
+   *   QUEUED  -> your order as a share of the resting bid. Both bounds apply.
+   *   INSIDE  -> nobody ahead. Only the upper bound applies, measured against
+   *              the depth BENEATH you, because that is what you sell back into.
+   *
+   * Both numbers are emitted so the card can show them separately. One field
+   * doing both jobs meant neither.
+   */
+  const depthSharePct = e.bidDepthKd > 0 ? (100 * e.notionalKd) / e.bidDepthKd : Infinity;
+  const inside = e.entryPlacement === 'INSIDE';
 
-  if (e.entryPlacement === 'QUEUED' && e.queueSharePct < screen.minQueueSharePct) {
-    queueReason = `${Math.round(e.bidQty).toLocaleString()} ahead — you would not fill`;
-  } else if (exitSharePct > screen.maxQueueSharePct) {
-    queueReason = exitSharePct >= 100
+  let queueReason = null;
+  if (!inside && e.queueSharePct < screen.minQueueSharePct) {
+    queueReason = `queue ${e.queueSharePct.toFixed(1)}% — ` +
+      `${Math.round(e.bidQty).toLocaleString()} shares ahead of you`;
+  } else if (depthSharePct > screen.maxQueueSharePct) {
+    queueReason = depthSharePct >= 100
       ? 'you would be the book'
-      : `${exitSharePct.toFixed(0)}% of the depth — you move the book on the way out`;
+      : `${depthSharePct.toFixed(0)}% of the depth — you move the book on the way out`;
   }
   const queueOk = queueReason === null;
 
@@ -194,10 +212,19 @@ function verdict(e, screen = CFG.SCREEN, opts = {}) {
    * visible, with the reason on the row. Hiding the rule teaches nothing, and
    * the decision stays yours.
    */
-  const blocked = trendCfg.enabled && e.trend && (trendCfg.block || []).includes(e.trend);
-  const trendReason = blocked
+  /*
+   * Direction WARNS. `block` is empty by config (CR-12B) but the code must not
+   * rely on that alone — `mode` is the explicit switch, so setting block back to
+   * ['FALLING'] without also setting mode:'block' does nothing. One reading of
+   * intent, not two.
+   */
+  const trendWarn = trendCfg.enabled && e.trend === 'FALLING';
+  const blocked = trendCfg.mode === 'block'
+    && trendCfg.enabled && e.trend && (trendCfg.block || []).includes(e.trend);
+  const trendReason = trendWarn
     ? `falling ${Math.abs(Math.round(e.trendChangeFils ?? 0))} fils over ${trendCfg.lookbackDays} days — ` +
-      'an unlifted offer here costs 17x more'
+      'an unlifted offer here costs 17x more. Warning only: this filter scored ' +
+      'one modelled save against three real costs.'
     : null;
 
   const hardFails = fail.filter((f) => !f.startsWith('net '));
@@ -227,8 +254,17 @@ function verdict(e, screen = CFG.SCREEN, opts = {}) {
   const gates = [
     { label: 'Net', ok: moneyOk,
       value: Number.isFinite(e.netKd) ? `${e.netKd >= 0 ? '+' : '−'}${Math.abs(e.netKd).toFixed(2)}` : '—' },
-    { label: 'Queue', ok: e.postablePct == null ? queueOk : e.postablePct >= (gapCfg.minPostablePct ?? 0),
-      value: e.postablePct == null ? (queueOk ? 'ok' : 'wall') : `${Math.round(e.postablePct)}%` },
+    /*
+     * The Queue pill is QUEUE SHARE, not postable-%. Those are different
+     * questions and were sharing a label: 63% postable is good (above the 50%
+     * floor) while 63% queue share is bad (above the 30% ceiling), so a single
+     * pill could not mean anything. Postable-% now has its own.
+     */
+    { label: 'Queue', ok: queueOk,
+      value: inside ? '0% inside' : `${e.queueSharePct.toFixed(1)}%`,
+      sub: `${Math.round(e.bidQty || 0).toLocaleString()} sh` },
+    { label: 'Postable', ok: e.postablePct == null || e.postablePct >= (gapCfg.minPostablePct ?? 0),
+      value: e.postablePct == null ? '—' : `${Math.round(e.postablePct)}%` },
     { label: 'Trend', ok: !blocked, value: e.trend ? e.trend.toLowerCase() : '—' },
     { label: 'Trades', ok: !(gapCfg.minTradesPerDay && e.trades < gapCfg.minTradesPerDay),
       value: `${Math.round(e.trades || 0)}/d` },
@@ -246,6 +282,11 @@ function verdict(e, screen = CFG.SCREEN, opts = {}) {
     state,
     gates,
     reasons,
+    // Both readings, so the card never has to guess which one it is showing.
+    queueSharePct: inside ? 0 : e.queueSharePct,
+    depthSharePct: Number.isFinite(depthSharePct) ? depthSharePct : null,
+    entryPlacement: e.entryPlacement,
+    trendWarn,
     tradeable,
     moneyOk,
     queueOk,

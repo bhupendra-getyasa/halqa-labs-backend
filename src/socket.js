@@ -192,8 +192,22 @@ function registerSpreadHandlers(io, socket) {
       // A claim is spent the moment the order exists.
       await repo.removeClaim(day, symbol).catch(() => {});
 
+      /*
+       * H4. A sell that loses money is recorded, and then said out loud. The
+       * warning rides on the receipt so it appears in the same place as every
+       * other write outcome rather than needing its own channel.
+       */
+      let warning = null;
+      if (String(leg.side).toUpperCase() === 'SELL' && seq) {
+        const d = await svc.detail(symbol, day).catch(() => null);
+        const c = d && d.contracts.find((x) => String(x.seq) === String(seq));
+        const w = svc.checkSell({ contract: c, price: leg.price, shares: leg.shares,
+                                  market: leg.market, day });
+        if (w) warning = w.message;
+      }
+
       reply(ack, 'leg', {
-        ok: true, order: saved,
+        ok: true, order: saved, warning,
         message: `C${saved.seq} ${saved.side} ${saved.price} × ${Number(saved.shares).toLocaleString()} saved (${saved.status})`,
       });
     } catch (e) {

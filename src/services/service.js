@@ -24,6 +24,7 @@ const LIVE = require('../lib/live.config');
 const SCREENER = require('../lib/screener');
 const CFG = require('../lib/spread.config');
 const EXIT = require('../lib/exit');
+const COMMISSION = require('../lib/commission');
 const repo = require('./repository');
 
 const TZ_OFFSET_H = LIVE.SESSION.tzOffsetHours;
@@ -31,8 +32,27 @@ const OPEN_H = LIVE.SESSION.openHour;
 const CLOSE_H = LIVE.SESSION.closeHour;
 
 /** Kuwait trading day as YYYY-MM-DD. */
+/*
+ * H3 — THE TRADING DAY IS A SESSION, NOT A CALENDAR DAY.
+ *
+ * kuwaitDay() rolled at Kuwait midnight, and claims are keyed
+ * (trading_day, symbol). Claim a stock at 20:45 UTC, come back at 21:15, and the
+ * ticker is querying a different day: 2026-08-03 becomes 2026-08-04 while the
+ * market has been shut for eight hours. The claim is still in the table and
+ * nothing reads it — "it's gone from Trading".
+ *
+ * A Kuwait session runs 09:00-13:00. Everything after the close belongs to the
+ * session that just ended, up to a cutoff in the small hours. Work done in the
+ * evening — which is when this is used — no longer straddles a roll that has
+ * nothing to do with the market.
+ */
+const SESSION_ROLL_H = 4;   // Kuwait 04:00 — five hours before the open
+
 function kuwaitDay(d = new Date()) {
-  return new Date(d.getTime() + TZ_OFFSET_H * 3600000).toISOString().slice(0, 10);
+  const k = new Date(d.getTime() + TZ_OFFSET_H * 3600000);
+  // Before the roll hour, the session that matters is still yesterday's.
+  if (k.getUTCHours() < SESSION_ROLL_H) k.setUTCDate(k.getUTCDate() - 1);
+  return k.toISOString().slice(0, 10);
 }
 function kuwaitNow(d = new Date()) {
   return new Date(d.getTime() + TZ_OFFSET_H * 3600000);
@@ -265,6 +285,9 @@ async function tick(tradingDay = kuwaitDay(), db = pool) {
     if (!d.contextError && d.trends.size === 0) {
       d.contextError = 'Trend filter is OFF — stock_prices_daily returned no rows for this lookback.';
     }
+    d.history = await repo.historyCoverage(db)
+      .then((h) => ({ ...h, needed: CFG.GAP.baselineDays ?? 20 }))
+      .catch(() => null);
     d.contextDay = tradingDay;
   }
 
@@ -553,10 +576,36 @@ function buildContracts(legs) {
     const seq = Number(l.seq);
     if (!bySeq.has(seq)) bySeq.set(seq, { seq, buy: null, sell: null });
     const slot = String(l.side).toLowerCase() === 'sell' ? 'sell' : 'buy';
+    /*
+     * H1 — WHICH LEG WINS, DETERMINISTICALLY.
+     *
+     * This was `new Date(l.posted_at) >= new Date(cur.posted_at)`. Every leg
+     * recorded in one sitting carries the SAME posted_at, so `>=` was always
+     * true and whichever row SQL happened to return last won. Proved with real
+     * data: the same three legs fed in two orders produced "holding" and
+     * "offered" — a cancelled sell hiding a live resting one, and with it the
+     * wrong exit rules, the wrong alert and the wrong trailing offer.
+     *
+     * Two rules, in order:
+     *   1. An UNRESOLVED leg beats a resolved one. A cancelled order and the
+     *      order that replaced it are both real; the live one is the one you
+     *      are trading.
+     *   2. Otherwise the later leg wins, tie-broken on id so the answer never
+     *      depends on row order.
+     */
     const cur = bySeq.get(seq)[slot];
-    // Two legs on the same side and seq: the later one wins for display, but
-    // both stay in the DB. Silently dropping one would hide a double-entry.
-    if (!cur || new Date(l.posted_at) >= new Date(cur.posted_at)) bySeq.get(seq)[slot] = l;
+    if (!cur) { bySeq.get(seq)[slot] = l; continue; }
+
+    const live = (x) => x.status === 'POSTED' || x.status === 'FILLED'
+      || x.status === 'CARRIED' || x.status === 'AUCTION_SUBMITTED';
+    const curLive = live(cur), newLive = live(l);
+    let take;
+    if (newLive !== curLive) take = newLive;
+    else {
+      const t = new Date(l.posted_at) - new Date(cur.posted_at);
+      take = t !== 0 ? t > 0 : Number(l.id) > Number(cur.id);
+    }
+    if (take) bySeq.get(seq)[slot] = l;
   }
 
   return [...bySeq.values()].sort((a, b) => a.seq - b.seq).map((c) => {
@@ -621,6 +670,43 @@ function exitPlan(contract, book, cfg = CFG.EXIT) {
     // taking a second argument nobody would remember to pass.
     cfg: { ...cfg, __shares: shares },
   });
+}
+
+/**
+ * H4 — WOULD THIS SELL LOSE MONEY?
+ *
+ * C1 on 3 August bought 5,500 at 144 and sold 5,500 at 144. Gross zero,
+ * commission 3.376, net −3.38 KD, recorded without a word. The exit module knew
+ * break-even was 0.614 fils and the first profitable tick was 145; nothing
+ * checked the sell price against the buy on the same contract at the point of
+ * entry.
+ *
+ * WARN, never block — you may have a reason to close flat, and a hard stop on a
+ * recording form is worse than a losing trade you meant to make. But it must be
+ * said before the save, not discovered in the P&L.
+ */
+function checkSell({ contract, price, shares, market, day }) {
+  if (!contract || !contract.buy) return null;
+  const entry = Number(contract.buy.price);
+  const sh = Number(shares || contract.buy.shares);
+  const px = Number(price);
+  if (!Number.isFinite(entry) || !Number.isFinite(px) || !Number.isFinite(sh)) return null;
+
+  const roundTrip = COMMISSION.roundTripKd((entry * sh) / 1000,
+    { cfg: LIVE.COMMISSION, market, day });
+  const gross = ((px - entry) * sh) / 1000;
+  const net = gross - roundTrip;
+  if (net > 0) return null;
+
+  const floorFils = EXIT.costFloorFils(roundTrip, sh);
+  const firstProfitable = entry + Math.floor(floorFils) + 1;
+  return {
+    net: Number(net.toFixed(3)),
+    entry, firstProfitable,
+    message: `Selling at ${px} against an entry of ${entry} nets ${net >= 0 ? '+' : '−'}` +
+             `${Math.abs(net).toFixed(2)} KD after ${roundTrip.toFixed(2)} commission. ` +
+             `The first profitable tick is ${firstProfitable}.`,
+  };
 }
 
 /** Detail view for one symbol — book, suggested order, contracts, P&L. */
@@ -695,5 +781,5 @@ async function detail(symbol, tradingDay = kuwaitDay(), db = pool) {
 module.exports = {
   kuwaitDay, kuwaitNow, isSession, minutesToClose,
   latestBook, oneSymbol, tick, inspectSymbol, setBudget, detail,
-  materialChange, buildAlerts, buildContracts, exitPlan,
+  materialChange, buildAlerts, buildContracts, exitPlan, checkSell,
 };

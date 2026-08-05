@@ -84,7 +84,9 @@ module.exports = {
     // Under 2% you sit behind a wall and never fill. Over 30% you ARE the book:
     // KHOT on 28-Jul showed +10.51 KD/trip and 104% queue share, which is not an
     // opportunity, it is you talking to yourself.
-    minQueueSharePct: 2,
+    // 5%, not 2%. Below 5% of the resting bid you are behind a wall that has to
+    // clear before you exist: 836,945 ahead never filled.
+    minQueueSharePct: 5,
     maxQueueSharePct: 30,
 
     // Exit depth. Getting in is the easy half.
@@ -158,7 +160,27 @@ module.exports = {
      * downtrend as calm and lets exactly the wrong stock through.
      */
     lookbackDays: 20,
-    block: ['FALLING'],
+    /*
+     * WARN, NEVER BLOCK — CR-12B.
+     *
+     * Scorecard since shipping: one save against three costs, and the save is a
+     * modelled replay rather than a realised gain.
+     *
+     *   28 Jul  blocked EMIRATES   saved ~57 KD   <- modelled, not realised
+     *   2 Aug   blocked EMIRATES   cost ~2.50     ran 139 -> 148 within the hour
+     *   3 Aug   skipped EMIRATES   cost the best setup of the day
+     *   3 Aug   demoted AQAR       cost the better stock
+     *
+     * It cannot tell a declining 20-day line from a stock that has stopped
+     * falling: EMIRATES read 155 -> 147 while the last four sessions were a base
+     * at 135-147. And the 28 July case it was built for is now caught by the
+     * price band anyway — a 148-fil entry on an 18-fil range.
+     *
+     * The direction still ranks (expectedFilsByTrend) and still shows on the
+     * card with its numbers. It no longer removes anything.
+     */
+    mode: 'warn',
+    block: [],
     // Rank multiplier. netKd answers "is it worth it"; this answers "will it
     // come back to me". Ranking on netKd alone is what produced EMIRATES.
     expectedFilsByTrend: { RISING: 0.912, FLAT: 0.780, FALLING: 0.715 },
@@ -187,6 +209,14 @@ module.exports = {
      * is not reliably postable at this slot size.
      */
     minPostablePct: 50,
+    /*
+     * The window every baseline is computed over. stock_quotes has been rolling
+     * at 12 days, so four gates — trades baseline, volume ratio, frozen
+     * percentage, average trade size — have been computing 20-day figures from
+     * 12 days of data. Stopping the roll is a retention setting in the ingestion
+     * service, not here; this is the number that becomes correct once it does.
+     */
+    baselineDays: 20,
     postableLowPct: 2,
     postableHighPct: 30,
     minGapPct: 40,
@@ -196,7 +226,20 @@ module.exports = {
     // frequency alone surfaced KAMCO at 67.9% gap — 86 trades a day, 8 of them
     // in the first ninety minutes. gapPct is a TIEBREAKER between stocks that
     // already pass liquidity, never a primary rank.
-    minTradesPerDay: 150,
+    /*
+     * SANITY FLOOR ONLY — 40, not 150.
+     *
+     * This was 150, raised from a single failure (KAMCO: 67.9% gap on 86 trades,
+     * motionless). It then hid COAST, INOVEST and AMAR on 2 August — three of
+     * the four best candidates that day. Raised again to 100 to catch KHOT, it
+     * hid MADAR.
+     *
+     * A filter built from one failure over-rejects. The property that actually
+     * separates KHOT from MADAR is not the trade COUNT — KHOT does 19 trades of
+     * 1,219 shares on an 8.68-fil spread, MADAR does 85 of 10,061 on 1.37. Those
+     * are named directly by minAvgTradeSize and maxAvgSpreadFils below.
+     */
+    minTradesPerDay: 40,
     gapLookbackSessions: 10,
   },
 
@@ -230,7 +273,14 @@ module.exports = {
      * the bid — which you must never take — or the auction. Elapsed minutes
      * cannot know that; the clock can.
      */
-    stepDownAtClock: '12:00',
+    /*
+     * 11:00, NOT 12:00 — three separate findings now.
+     *
+     * The clearest is 4 August: the best exit at 10:50 was 222 for −3.48; by
+     * 11:15 it was 221 for −7.18. Waiting 25 minutes cost 3.70 KD, more than the
+     * day's first trade earned.
+     */
+    stepDownAtClock: '11:00',
     // NOT IN THE CR, AND IT MATTERS. armAtFils: 1 can arm below break-even:
     // the CR itself shows a 1-fil capture at 800 KD on a 235-fil stock nets
     // -0.06 KD. Trailing out at +1 there books a loss. With this true the arm

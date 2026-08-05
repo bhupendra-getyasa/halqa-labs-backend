@@ -218,6 +218,26 @@ app.get('/api/diag', async (_req, res) => {
   res.status(out.ok ? 200 : 500).json(out);
 });
 
+/*
+ * BUG-1. Is the queue percentage reading a live book?
+ *   GET /api/diag/queue?symbol=NRE
+ */
+app.get('/api/diag/queue', async (req, res) => {
+  try { res.json(await repo.queueDiagnostic(req.query.symbol || 'NRE')); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+/** How many days stock_quotes actually holds. Four gates need 20. */
+app.get('/api/diag/history', async (_req, res) => {
+  try {
+    const h = await repo.historyCoverage();
+    res.json({ ...h, needed: 20, sufficient: h.days >= 20,
+      note: h.days < 20
+        ? `only ${h.days} days retained — the 20-day baselines behind CR-19, CR-21, CR-22 and CR-24 cannot be computed`
+        : 'sufficient for the 20-day baselines' });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 /** The timestamped action log. Analysis only — not rendered anywhere. */
 app.get('/api/log', async (req, res) => {
   try { res.json(await repo.eventsForDay(req.query.date || svc.kuwaitDay())); }

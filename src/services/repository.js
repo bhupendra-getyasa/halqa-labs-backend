@@ -548,6 +548,75 @@ async function trendMap(asOfDay, lookbackDays = 20, db = pool) {
 }
 
 /*
+ * How much history stock_quotes actually holds.
+ *
+ * Four gates are computed from a 20-day window — trades baseline, volume ratio,
+ * frozen percentage and average trade size — and the table has been rolling at
+ * 12 days. A gate whose denominator does not exist does not fail loudly; it
+ * quietly computes something wrong. This reports the real coverage so the
+ * screen can say so rather than showing a confident number built on 12 days.
+ */
+async function historyCoverage(db = pool) {
+  await ensure(db);
+  const { rows: [r] } = await db.query(
+    `SELECT count(DISTINCT (created_at AT TIME ZONE 'UTC' + interval '3 hours')::date) AS days,
+            min((created_at AT TIME ZONE 'UTC' + interval '3 hours')::date) AS oldest,
+            max((created_at AT TIME ZONE 'UTC' + interval '3 hours')::date) AS newest
+       FROM public.stock_quotes;`);
+  return { days: Number(r.days), oldest: r.oldest, newest: r.newest };
+}
+
+/*
+ * BUG-1 diagnostic — is the queue percentage reading a live book?
+ *
+ * NRE rendered 9.0% against 71,000 shares while its 5-day median bid is 528,888.
+ * The percentage is arithmetically right for the depth it was handed, so the
+ * DEPTH is the suspect number. 7.4x is not 10, 100 or 1000, which rules out a
+ * unit conversion and leaves three candidates:
+ *
+ *   1. bid_qty is level-1 only and the book genuinely thinned today
+ *   2. the quote is stale — the fallback chain returned an old Trading row
+ *   3. bid_qty arrives as formatted text and casts badly
+ *
+ * `age_minutes` separates (2) from the others in one read.
+ */
+async function queueDiagnostic(symbol, db = pool) {
+  await ensure(db);
+  const sym = String(symbol || '').trim().toUpperCase();
+  const { rows } = await db.query(
+    `WITH live AS (
+       SELECT bid, bid_qty, offer, offer_qty, created_at, session,
+              EXTRACT(EPOCH FROM (now() - created_at))/60 AS age_minutes
+         FROM public.stock_quotes
+        WHERE upper(symbol) = $1 AND session = 'Trading'
+        ORDER BY created_at DESC LIMIT 1
+     ), med AS (
+       SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY bid_qty) AS med_bid_qty,
+              count(*) AS samples
+         FROM public.stock_quotes
+        WHERE upper(symbol) = $1 AND session = 'Trading' AND bid_qty > 0
+          AND created_at >= now() - interval '5 days'
+     )
+     SELECT live.*, med.med_bid_qty, med.samples,
+            med.med_bid_qty / NULLIF(live.bid_qty,0) AS median_over_live
+       FROM live, med;`, [sym]);
+  const r = rows[0];
+  if (!r) return { symbol: sym, found: false };
+  const ratio = Number(r.median_over_live);
+  return {
+    symbol: sym, found: true,
+    liveBidQty: Number(r.bid_qty), medianBidQty: Number(r.med_bid_qty),
+    medianOverLive: Number.isFinite(ratio) ? Number(ratio.toFixed(2)) : null,
+    ageMinutes: Number(Number(r.age_minutes).toFixed(1)),
+    samples: Number(r.samples),
+    verdict: !Number.isFinite(ratio) ? 'no median to compare'
+      : Number(r.age_minutes) > 10 ? `STALE — this quote is ${Math.round(r.age_minutes)} minutes old`
+      : ratio >= 5 ? `book is ${ratio.toFixed(1)}x thinner than its 5-day median — live read, genuinely thin, or level-1 only`
+      : 'live depth is in line with the median',
+  };
+}
+
+/*
  * GATE 2 — postable queue, measured across ticks.
  *
  * Not "is the depth right-sized this instant" but "how often is it". Depth
@@ -569,8 +638,8 @@ async function postableMap(asOfDay, slotKd, cfg, db = pool) {
        FROM public.stock_quotes
       WHERE session = 'Trading' AND bid > 0 AND offer > bid
         AND (created_at AT TIME ZONE 'UTC' + interval '3 hours')::date
-            BETWEEN ($1::date - interval '12 days') AND $1::date
-      GROUP BY symbol;`, [asOfDay, lo, hi]);
+            BETWEEN ($1::date - ($4 || ' days')::interval) AND $1::date
+      GROUP BY symbol;`, [asOfDay, lo, hi, cfg.baselineDays ?? 20]);
   const m = new Map();
   for (const r of rows) m.set(r.symbol, { pct: Number(r.pct_postable), ticks: Number(r.ticks) });
   return m;
@@ -1000,6 +1069,7 @@ module.exports = {
   nextSeq, recordLeg, resolveLeg, updateLeg, deleteLeg, legById,
   legsForDay, legsForContractsTouching, openLegs, eventsForDay,
   openPositions, setCarryState, bumpPeak, trendMap, gapMap, postableMap, resolveDailyCols,
+  historyCoverage, queueDiagnostic,
   recordCash, postFillCash, reverseFillCash, cashLedger, accountSummary,
   listClaims, addClaim, removeClaim,
   writeSnapshot, snapshotAt, snapshotTimes,
