@@ -27,6 +27,8 @@ const PORT = Number(process.env.PORT || 4000);
 const TICK_MS = Number(process.env.TICK_INTERVAL_MS || 15000);
 const AUTH_TOKEN = process.env.AUTH_TOKEN || '';           // shared secret; when set, posts must include it
 const RESTRICT = String(process.env.RESTRICT_TO_SNAPSHOT || 'false') === 'true';
+const MAX_ROWS = 1000;
+const CHUNK = 200;
 
 // Same target table + column order as your original scraper.
 const DB_COLUMNS = [
@@ -44,6 +46,32 @@ const DEPTH_COLUMNS = [
   'bid_price', 'bid_qty', 'offer_price', 'offer_qty',
   'captured_at', 'trading_date', 'created_at',
 ];
+
+const COLUMNS = [
+  ['batch_id',      r => str(r.batchId)],
+  ['captured_at',   r => r.capturedAt ? new Date(r.capturedAt) : new Date()],
+  ['row_index',     r => int(r.rowIndex)],
+  ['symbol',        r => str(r.symbol)],
+  ['code',          r => str(r.code)],
+  ['s_description', r => str(r.sDescription)],
+  ['order_id',      r => str(r.orderId)],
+  ['status',        r => str(r.status)],
+  ['side',          r => str(r.side)],
+  ['quantity',      r => dec(r.quantity)],
+  ['price',         r => dec(r.price)],
+  ['filled',        r => dec(r.filled)],
+  ['remaining',     r => dec(r.remaining)],
+  ['avg_price',     r => dec(r.avgPrice)],
+  ['order_type',    r => str(r.orderType)],
+  ['good_till',     r => str(r.goodTill)],
+  ['exchange',      r => str(r.exchange)],
+  ['portfolio',     r => str(r.portfolio)],
+  ['order_time',    r => str(r.orderTime)],
+  ['order_date',    r => str(r.orderDate)],
+  ['order_value',   r => dec(r.orderValue)],
+  ['raw',           r => (r.raw && typeof r.raw === 'object') ? JSON.stringify(r.raw) : null]
+]
+
 // Accepts flat rows: {symbol, code, description, level, bidPrice, bidQty, offerPrice, offerQty}
 async function saveDepth(records) {
   if (!records || !records.length) return { inserted: 0, received: 0 };
@@ -111,6 +139,14 @@ function toRow(r, batchId, createdAt, tradingDate) {
   ];
 }
 
+function str(v) { if (v == null) return null; const s = String(v).trim(); return s ? s.slice(0, 512) : null; }
+function dec(v) {
+  if (v == null || v === '') return null;
+  const n = typeof v === 'number' ? v : parseFloat(String(v).replace(/,/g, ''));
+  return Number.isFinite(n) ? n : null;
+}
+function int(v) { const n = dec(v); return n == null ? null : Math.trunc(n); }
+
 // ── optional snapshot-symbol filter (mirrors your original behaviour) ─────────
 let snapCache = { at: 0, set: null };
 async function allowedSymbols() {
@@ -173,8 +209,8 @@ async function saveQuotes(records) {
 }
 
 const app = express();
-app.use(cors({ origin: process.env.CORS_ORIGIN || '*' }));
-// app.use(express.json());
+// app.use(cors({ origin: process.env.CORS_ORIGIN || '*' }));
+app.use(cors({ origin: '*' }));
 
 // Allow the userscript (running on https://www.awsatbroker.com) to POST here.
 app.use((req, res, next) => {
@@ -371,6 +407,44 @@ app.post('/depth-symbols', async (req, res) => {
     } catch (e) { await client.query('ROLLBACK'); throw e; } finally { client.release(); }
     res.json({ ok: true, upserted: n });
   } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/orders', async (req, res) => {
+  let body = req.body;
+  if (AUTH_TOKEN && (req.body?.token !== AUTH_TOKEN)) return res.status(401).json({ error: 'unauthorized' });
+
+  const records = Array.isArray(body.records) ? body.records.slice(0, MAX_ROWS) : [];
+  if (!records.length) return res.json({ inserted: 0 });
+
+  const names = COLUMNS.map(c => c[0]).join(', ');
+  const client = await pool.connect();
+  let inserted = 0;
+  try {
+    await client.query('BEGIN');
+    for (let i = 0; i < records.length; i += CHUNK) {
+      const chunk = records.slice(i, i + CHUNK);
+      const values = [];
+      const tuples = chunk.map((rec, rowIdx) => {
+        const ph = COLUMNS.map((col, colIdx) => {
+          values.push(col[1](rec));
+          return '$' + (rowIdx * COLUMNS.length + colIdx + 1);
+        });
+        return '(' + ph.join(', ') + ')';
+      });
+      const sql = `INSERT INTO order_list_snapshots (${names}) VALUES ${tuples.join(', ')}`;
+      const out = await client.query(sql, values);
+      inserted += out.rowCount || 0;
+    }
+    await client.query('COMMIT');
+  } catch (err) {
+    try { await client.query('ROLLBACK'); } catch (e) { /* ignore */ }
+    console.error('[/orders] insert failed:', err.message);
+    return res.status(500).json({ error: err.message, inserted: 0 });
+  } finally {
+    client.release();
+  }
+
+  return res.json({ inserted, received: records.length });
 });
 
 const server = http.createServer(app);
