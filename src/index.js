@@ -98,7 +98,7 @@ async function saveDepth(records) {
         return `(${ph.join(', ')})`;
       });
       const sql = `INSERT INTO stock_depth (${cols}) VALUES ${tuples.join(', ')} ` +
-                  `ON CONFLICT (symbol, level, created_at) DO NOTHING`;
+                  `ON CONFLICT (symbol, level, captured_at) DO NOTHING`;
       const res = await client.query(sql, values);
       inserted += res.rowCount;
     }
